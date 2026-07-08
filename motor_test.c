@@ -3,6 +3,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <ncurses.h>
+#include "lidar.h" 
+#include "servo.h"
+#include "common.h"
 
 #define MCU_ADDR 	0x14
 #define MOTOR1_PWM_REG  0X2D
@@ -16,11 +19,13 @@
 #define DIR_PIN_2 24
 #define MCU_RST_PIN 5
 
-static int fd;
+static int motor_fd;
 static int count = 0; 
 
 void keyboard_init();
-int write_reg16_reversed(int fd, int reg, int value);
+
+//int write_reg16_reversed(int fd, int reg, int value);
+
 void mcu_hard_reset(void);
 void motor_init(void);
 void motor_set_speed(int speed);
@@ -30,7 +35,29 @@ void input();
 
 int main(void)
 {
-	input();
+
+	wiringPiSetupGpio();
+	//lidar_init();
+
+	int servo_fd = wiringPiI2CSetup(MCU_ADDR);
+
+	servo_init(servo_fd);
+
+	servo_set_angle(-45, servo_fd);
+
+
+	//mcu_hard_reset();
+
+	//input();
+
+	//int distance = 0; 
+
+	//while(1)
+	//{
+	//	distance = lidar_read_distance();
+	//	delay(100); 
+	//}	
+
 	delay(2000);
 	motor_stop();
 	endwin();
@@ -46,11 +73,11 @@ void keyboard_init()
 	nodelay(stdscr, TRUE);
 }
 
-int write_reg16_reversed(int fd, int reg, int value)
-{
-	int swapped_value = ((value >> 8) & 0x00FF) | ((value << 8) & 0xFF00);
-	return wiringPiI2CWriteReg16(fd, reg, swapped_value);
-} 
+//int write_reg16_reversed(int fd, int reg, int value)
+//{
+//	int swapped_value = ((value >> 8) & 0x00FF) | ((value << 8) & 0xFF00);
+//	return wiringPiI2CWriteReg16(fd, reg, swapped_value);
+//} 
 
 void mcu_hard_reset(void)
 {
@@ -69,16 +96,16 @@ void motor_init(void)
 	pinMode(DIR_PIN_1,OUTPUT);
 	pinMode(DIR_PIN_2,OUTPUT);
 
-	fd = wiringPiI2CSetup(MCU_ADDR);
+	motor_fd = wiringPiI2CSetup(MCU_ADDR);
 
-	if (fd < 0)
+	if (motor_fd < 0)
 	{
 		fprintf(stderr, "it can't connect to I2c\n");
 		exit(1);
 	}
 
-	write_reg16_reversed(fd, TIMER_PERIOD_REG, PERIOD_VALUE);
-	write_reg16_reversed(fd, TIMER_PERSCALER_REG, PRECLAER_VALUE - 1);
+	write_reg16_reversed(motor_fd, TIMER_PERIOD_REG, PERIOD_VALUE);
+	write_reg16_reversed(motor_fd, TIMER_PERSCALER_REG, PRECLAER_VALUE - 1);
 
 }
 
@@ -89,8 +116,8 @@ void motor_set_speed(int speed)
 	
 	for(int i = 0; i < 10; i++)
 	{
-		int signal_1 = write_reg16_reversed(fd, MOTOR1_PWM_REG, (PERIOD_VALUE * speed) / 100);
-		int signal_2 = write_reg16_reversed(fd, MOTOR2_PWM_REG, (PERIOD_VALUE * speed) / 100);
+		int signal_1 = write_reg16_reversed(motor_fd, MOTOR1_PWM_REG, (PERIOD_VALUE * speed) / 100);
+		int signal_2 = write_reg16_reversed(motor_fd, MOTOR2_PWM_REG, (PERIOD_VALUE * speed) / 100);
 	
 		if (signal_1 == 0 && signal_2 == 0) break;
 
@@ -144,3 +171,4 @@ void input()
 		delay(5);
 	}
 }
+
