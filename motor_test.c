@@ -17,8 +17,25 @@
 #define MCU_RST_PIN 5
 
 static int fd;
-
 static int count = 0; 
+
+void keyboard_init();
+int write_reg16_reversed(int fd, int reg, int value);
+void mcu_hard_reset(void);
+void motor_init(void);
+void motor_set_speed(int speed);
+void motor_set_direction(int forward);
+void motor_stop(void);
+void input();
+
+int main(void)
+{
+	input();
+	delay(2000);
+	motor_stop();
+	endwin();
+	return 0;
+}
 
 void keyboard_init() 
 {
@@ -31,7 +48,6 @@ void keyboard_init()
 
 int write_reg16_reversed(int fd, int reg, int value)
 {
-
 	int swapped_value = ((value >> 8) & 0x00FF) | ((value << 8) & 0xFF00);
 	return wiringPiI2CWriteReg16(fd, reg, swapped_value);
 } 
@@ -47,13 +63,12 @@ void mcu_hard_reset(void)
 
 void motor_init(void)
 {
-	//if (count >= 1) return;
-
 	wiringPiSetupGpio();
 	mcu_hard_reset();
 
 	pinMode(DIR_PIN_1,OUTPUT);
 	pinMode(DIR_PIN_2,OUTPUT);
+
 	fd = wiringPiI2CSetup(MCU_ADDR);
 
 	if (fd < 0)
@@ -65,35 +80,19 @@ void motor_init(void)
 	write_reg16_reversed(fd, TIMER_PERIOD_REG, PERIOD_VALUE);
 	write_reg16_reversed(fd, TIMER_PERSCALER_REG, PRECLAER_VALUE - 1);
 
-	//count++;
 }
 
 void motor_set_speed(int speed)
 {
   	if (speed < 0) speed = 0;
-	//if (speed > 100) speed = 100;
-
-	//int signal_1 = wiringPiI2CWriteReg16(fd, MOTOR1_PWM_REG, (PERIOD_VALUE * speed) / 100);
-	//int signal_2 = wiringPiI2CWriteReg16(fd, MOTOR2_PWM_REG, (PERIOD_VALUE * speed) / 100);	
+	if (speed > 100) speed = 100;
 	
-
-	// this is problem find sync solution  
 	for(int i = 0; i < 10; i++)
 	{
 		int signal_1 = write_reg16_reversed(fd, MOTOR1_PWM_REG, (PERIOD_VALUE * speed) / 100);
 		int signal_2 = write_reg16_reversed(fd, MOTOR2_PWM_REG, (PERIOD_VALUE * speed) / 100);
 	
-		if (signal_1 != -1 && signal_2 != -1) 
-		{
-			printf("s1 : %d ", signal_1); 
-			printf("s2 : %d ", signal_2); 
-			break;
-		}
-		else
-		{
-			printf("else s1 : %d ", signal_1); 
-			printf("else s2 : %d ", signal_2); 
-		}
+		if (signal_1 == 0 && signal_2 == 0) break;
 
 		delay(2);
 	}
@@ -135,23 +134,13 @@ void input()
 				motor_set_direction(1);
 				break;
 			case 32:
-				printf("down\n");
+				printf("stop\n");
 				motor_init();
-				motor_stop();
-				return;
-
+				motor_set_speed(0);
+				motor_set_direction(0);
+				break;
 		}
 
 		delay(5);
 	}
-
-}
-
-int main(void)
-{
-	input();
-	delay(2000);
-	motor_stop();
-	endwin();
-	return 0;
 }
