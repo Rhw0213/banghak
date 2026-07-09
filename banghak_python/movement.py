@@ -1,6 +1,6 @@
 """
 movement.py
-역할: 연속 저속 전진 (킥스타트로 정지 마찰 극복 후 저속 유지)
+역할: 연속 저속 전진
 """
 
 from picarx import Picarx
@@ -14,24 +14,14 @@ SPEED_TABLE = {
     50: 30.5,
 }
 
-DUTY = 13           # 유지할 저속 듀티
-KICK_DUTY = 35       # 시작할 때 순간적으로 밀어줄 듀티 (정지 마찰 극복용)
-KICK_TIME = 0.08     # 킥스타트 지속 시간 (초) - 너무 길면 그냥 빨라짐
+DUTY = 25  # 유지할 저속 듀티
 
 
-def move_forward(px, duty=DUTY, kick=True):
+def move_forward(px, duty=DUTY):
     px.set_dir_servo_angle(0)
-
     px.motor_direction_pins[0].low()
     px.motor_direction_pins[1].high()
 
-    if kick:
-        # 1단계: 짧게 강하게 밀어서 정지 마찰 극복
-        px.motor_speed_pins[0].pulse_width_percent(KICK_DUTY)
-        px.motor_speed_pins[1].pulse_width_percent(KICK_DUTY)
-        time.sleep(KICK_TIME)
-
-    # 2단계: 원하는 저속으로 낮춰서 유지 (이미 구르는 중이라 낮은 듀티로도 유지됨)
     duty = max(0, min(100, duty))
     px.motor_speed_pins[0].pulse_width_percent(duty)
     px.motor_speed_pins[1].pulse_width_percent(duty)
@@ -45,7 +35,7 @@ def stop(px):
 if __name__ == "__main__":
     px = Picarx()
     try:
-        print(f"전진 테스트 시작 (kick={KICK_DUTY}% -> duty={DUTY}%)")
+        print(f"전진 테스트 시작 (duty={DUTY}%)")
         move_forward(px, duty=DUTY)
         time.sleep(2)
         print("전진 테스트 종료")
