@@ -14,7 +14,7 @@ SPEED_TABLE = {
     50: 30.5,
 }
 
-DUTY = 25  # 유지할 저속 듀티
+DUTY = 50  # 유지할 저속 듀티
 
 
 def move_forward(px, duty=DUTY):
