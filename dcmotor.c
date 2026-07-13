@@ -1,5 +1,8 @@
 #include <wiringPi.h>
 #include <wiringPiI2C.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include "dcmotor.h"
 
 #define MCU_ADDR 	0x14
 #define MOTOR1_PWM_REG  0X2D
@@ -12,6 +15,7 @@
 #define DIR_PIN_1 23 //BCM NUMBER
 #define DIR_PIN_2 24
 #define MCU_RST_PIN 5
+
 
 void mcu_hard_reset(void)
 {

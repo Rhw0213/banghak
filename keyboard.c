@@ -17,7 +17,7 @@ void keyboard_cleanup()
 
 int keyboard_run() 
 {
-	key = getch();
+	int key = getch();
 
 	switch(key)
 	{

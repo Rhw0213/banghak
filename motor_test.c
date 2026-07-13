@@ -6,6 +6,7 @@
 #include "servo.h"
 #include "common.h"
 #include "keyboard.h"
+#include "dcmotor.h"
 
 #define MCU_ADDR 	0x14
 #define MOTOR1_PWM_REG  0X2D
@@ -19,22 +20,6 @@
 #define DIR_PIN_2 24
 #define MCU_RST_PIN 5
 
-extern void keyboard_init();
-extern int keyboard_run();
-extern int lidar_read_distance_median(int sample)
-extern void motor_stop(void)
-extern void motor_set_direction(int forward)
-extern void motor_set_speed(int speed)
-extern void motor_init(void)
-extern void mcu_hard_reset(void)
-
-//void mcu_hard_reset(void);
-//void motor_init(void);
-//void motor_set_speed(int speed);
-//void motor_set_direction(int forward);
-//void motor_stop(void);
-//int lidar_read_distance_median(int sample);
-
 void init();
 void run();
 
@@ -42,15 +27,6 @@ int speed = 50;
 
 int main(void)
 {
-	//wiringPiSetupGpio();
-	//delay(1000);
-	//lidar_init();
-	//motor_init();
-	//keyboard_init();
-	//fd = wiringPiI2CSetup(MCU_ADDR);
-	//servo_init();
-	//servo_set_angle(0);
-	//mcu_hard_reset();
 
 	init();
 	run();
@@ -80,6 +56,12 @@ void run()
 	while(keyboard_run())
 	{
 		int distance = lidar_read_distance_median(12);
+		int beforeDistance = 0;
+
+		if (distance < 0)
+		{
+			distance = beforeDistance;
+		}
 		
 		if (isActive == 0)
 		{
@@ -91,13 +73,9 @@ void run()
 
 		printf("distance : %d\r\n", distance);
 
-		if (distance <= 25)
+		if (distance <= 30)
 		{ 
-			sumAngle = 40.0f;  
-		}
-		else if (distance <= 30) 
-		{ 
-			sumAngle = 35.0f; 
+			sumAngle = 35.0f;  
 		}
 		else if (distance <= 35) 
 		{ 
@@ -123,13 +101,18 @@ void run()
 		{ 
 			sumAngle = 5.0f; 
 		}
+		else if (distance <= 65) 
+		{ 
+			sumAngle = .0f; 
+		}
 		else  
 		{ 
 			sumAngle = 0.0f; 
 		}
 
-		speed = 100 - (int)(sumAngle * 2.0f);
+		speed = 90 - (int)(sumAngle * 2.0f);
 
+		printf("speed : %d\r\n", speed);
 		if (sumAngle >= 40) 
 		{
 			sumAngle = 40; 
@@ -137,13 +120,15 @@ void run()
 
 		if (sumAngle != 0) 
 		{
-			motor_set_speed(0);
+			//motor_set_speed(0);
 			servo_set_angle(sumAngle);
-			delay(5);
+			//delay(10);
 			isActive = 0;
-			motor_set_speed(speed);
 		}
+		motor_set_speed(speed);
 
-		delay(5); 
+		beforeDistance = distance;
+
+		//delay(5); 
 	}	
 }
