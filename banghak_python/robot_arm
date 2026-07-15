@@ -1,0 +1,27 @@
+"""
+arm.py
+역할: 로봇팔 4개 서보 제어 (movement.py와 같은 원칙 - "어떻게 움직이는가"만 담당)
+"""
+
+from robot_hat import Servo, device
+import time
+
+#device.reset_mcu()
+# time.sleep(0.5)
+# 채널은 실제 배선한 P번호에 맞춰 수정
+base = Servo("P1")
+shoulder = Servo("P2")
+elbow = Servo("P3")
+gripper = Servo("P5")
+
+
+def set_arm_angles(base_angle=0, shoulder_angle=0, elbow_angle=0, gripper_angle=0):
+    base.angle(base_angle)
+    shoulder.angle(shoulder_angle)
+    elbow.angle(elbow_angle)
+    gripper.angle(gripper_angle)
+
+
+if __name__ == "__main__":
+    set_arm_angles(0, 0, 30, 0)   # 모든 관절 중앙(0도)으로
+    time.sleep(1)
