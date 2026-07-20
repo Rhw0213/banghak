@@ -1,11 +1,13 @@
-from picarx import Picarx, utils
+from picarx import Picarx 
+from robot_hat import reset_mcu
+
 import time
 
 px = Picarx()
 
 #30도
-px.set_cam_tilt_angle(-40)
-# px.set_dir_servo_angle(0)
+#px.set_cam_tilt_angle(-40)
+px.set_dir_servo_angle(0)
 # px.set_cam_pan_angle(0)
 time.sleep(2)
 
