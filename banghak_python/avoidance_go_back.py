@@ -20,7 +20,8 @@ avoidance_go_back.py
 
 
 def Get_Stop_Distance():
-    """후진으로 전환할 기준 거리(cm)를 반환. 이 숫자만 바꾸면 기준이 바뀜."""
+    """초음파 센서 전방 장애물 감지 범위
+       후진으로 전환할 기준 거리(cm)를 반환. 이 숫자만 바꾸면 기준이 바뀜."""
     return 10
 
 
@@ -61,9 +62,7 @@ class WallBackup:
         한 번 호출할 때마다 거리를 확인하고 전진/후진을 판단.
         반환값: 현재 상태 문자열 ("forward" / "backward")
         """
-        
-	
-	move_raw(self.px, backSpeed, "backward")
+        move_raw(self.px, backSpeed, "backward")
 	
 
 

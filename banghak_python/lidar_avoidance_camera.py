@@ -21,10 +21,14 @@ STEER_LIMIT = 35           # 서보 최대 조향각
 GAIN_REVERSE = False       # 조향 방향 반대면 True
 
 # 거리 임계값 (라이다=mm, 초음파=cm)
-DANGER_DIST_MM = 500       # 라이다 50cm 이내 위험
-STOP_DIST_MM = 350         # 라이다 35cm 이내 정지
-ULTRA_DANGER_CM = 40       # 초음파 40cm 이내 위험
-#ULTRA_STOP_CM = 25        # 초음파 25cm 이내 정지
+DANGER_DIST_MM = 500         # 라이다 50cm 이내 위험
+STOP_DIST_MM = 300           # 라이다 30cm 이내 정지
+# ULTRA_DANGER_CM = 40       # 초음파 40cm 이내 위험
+
+# ===== [추가] 후방 거리 기반 동적 후진거리 계산 설정 =====
+REAR_SECTOR_DEG = 25            # 후방 기준 ±25도 섹터
+REAR_SAFETY_MARGIN_CM = 15      # 벽에서 최소 유지할 거리(cm) - 실측으로 확인된 사각지대 마진
+DEFAULT_BACK_TARGET_CM = 60     # 기존 backSpeed 공식이 가정하는 '기준 후진거리'(cm) - 실측 후 조정 필요
 
 # 속도
 VELOCITY = 60 
@@ -62,6 +66,38 @@ def analyze_scan(scan):
             if -25 <= norm <= 25 and distance < front_min:
                 front_min = distance
     return best_angle, front_min
+
+
+# ===== [추가] 후방 섹터 최소거리(cm) 측정 =====
+def get_rear_min_cm(scan, sector_deg=REAR_SECTOR_DEG):
+    """후방(±sector_deg) 섹터 내 최소거리(cm) 반환. 감지 없으면 None"""
+    min_mm = None
+    for quality, angle, distance in scan:
+        if distance <= 0:
+            continue
+        norm = normalize_angle(angle)
+        if abs(norm) >= (180 - sector_deg):
+            if min_mm is None or distance < min_mm:
+                min_mm = distance
+    if min_mm is None:
+        return None
+    return min_mm / 10.0
+
+
+# ===== [추가] 후방 여유거리에 비례해 backSpeed(스텝 수) 동적 계산 =====
+def compute_dynamic_backspeed(rear_cm, base_backspeed):
+    """
+    rear_cm: 후진 시작 시점 후방 최소거리(cm), None이면 측정 실패
+    base_backspeed: 기존 고정 공식으로 계산된 backSpeed (상한선 역할)
+    반환값: 0이면 후진 자체를 하지 말아야 함 (이미 후방이 근접)
+    """
+    if rear_cm is None:
+        return base_backspeed   # 측정 실패 시 기존값 유지 (보수적 기본 동작)
+    available_cm = rear_cm - REAR_SAFETY_MARGIN_CM
+    if available_cm <= 0:
+        return 0
+    ratio = min(1.0, available_cm / DEFAULT_BACK_TARGET_CM)
+    return max(1, int(base_backspeed * ratio))
 
 
 def main():
@@ -163,8 +199,8 @@ def main():
     #BACK_TARGET = Get_Drive_Duty()   # 후진 목표 duty
     BACK_TARGET = VELOCITY * 0.65     # 후진 목표 duty
 
-    backSpeed = 20 * (50 / BACK_TARGET) # 후진시  
-
+    backSpeed = 20 * (50 / BACK_TARGET)   # 기존 고정 공식 (이제 '상한선' 역할)
+    current_backSpeed = backSpeed         # ===== [추가] 이번 후진에 실제로 사용할 값 =====
     steel_gain_result = 0
 
     try:
@@ -175,10 +211,10 @@ def main():
             ultra_cm = read_ultra_cm()                    # cm (-1이면 실패)
 
             # ===== 후진 구간: picarx(WallBackup) 경로만 사용 =====
-            if (isBack and (backCnt <= backSpeed)):
+            if (isBack and (backCnt <= current_backSpeed)):
                 duty = back_incre_Move(BACK_TARGET)
                 wallBackup.update(duty)
-                print(f"[후진] duty={duty} ({backCnt}/{backSpeed})")
+                print(f"[후진] duty={duty} ({backCnt}/{current_backSpeed})")
                 backCnt += 1
                 continue
             else:
@@ -196,8 +232,21 @@ def main():
                 set_decre_Move(0)   # 전진 속도를 서서히 0으로
                 steel_gain_result = clear_angle * STEER_GAIN;
                 set_steer(steel_gain_result)
-                print(f"[정지] 라이다 {lidar_min:.0f}mm 초음파 {ultra_cm:.0f}cm 트인 {clear_angle:.0f}도")
-                isBack = True
+
+                # ===== [추가] 후진 시작 전 후방 거리 측정 후 backSpeed 동적 계산 =====
+                rear_cm = get_rear_min_cm(scan)
+                current_backSpeed = compute_dynamic_backspeed(rear_cm, backSpeed)
+
+                if current_backSpeed == 0:
+                    # 후방도 이미 근접 -> 후진 자체를 하지 않음
+                    print(f"[후진 불가] 후방 {rear_cm}cm 이내 근접 - 후진 취소")
+                    isBack = False
+                else:
+                    rear_str = f"{rear_cm:.1f}cm" if rear_cm is not None else "측정불가"
+                    print(f"[정지] 라이다 {lidar_min:.0f}mm 초음파 {ultra_cm:.0f}cm 트인 {clear_angle:.0f}도 "
+                          f"| 후방 {rear_str} -> backSpeed {current_backSpeed}(기존 {backSpeed:.0f})")
+                    isBack = True
+                    backCnt = 0
                 continue
 
             # ===== 2순위: 위험 → 감속 + 회피 조향 =====
@@ -217,7 +266,6 @@ def main():
 
             if (not isBackFlag):
                 set_steer(steer_cmd)
-                print("ㅁ면면정ㅈ직직직ㄴ")
 
             if (isBackFlag and steer_cmd == 0):
                 isBackFlag = False
