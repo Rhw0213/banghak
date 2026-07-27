@@ -1,27 +1,35 @@
 # smooth_servo.py
-from robot_hat import Servo, reset_mcu
+# 역할: 서보 하나(관절 하나)를 부드럽게, 정해진 속도/각도 범위 안에서 움직이는 로직만 담당
+# robot_hat을 직접 import하지 않음 -> 어떤 환경(윈도우 포함)에서도 이 파일은 그대로 동작함
 import time
 
 
 class SmoothJoint:
     """현재 각도를 기억하면서 속도 제어가 가능한 서보 관절"""
 
-    def __init__(self, port, init_angle=0.0, min_angle=-90, max_angle=90, move_on_init=True):
-        self.servo = Servo(port)
+    def __init__(self, servo_driver, init_angle, min_angle, max_angle, move_on_init=True):
+        """
+        servo_driver: angle(값) 메서드를 가진 서보 객체 (실제 Servo든 MockServo든 바깥에서 주입받음)
+        init_angle: 시작 각도
+        min_angle, max_angle: 안전 이동 범위 (필수 입력값, 관절마다 반드시 지정)
+        """
+        self.servo = servo_driver
         self.min_angle = min_angle
         self.max_angle = max_angle
         self.angle = init_angle
         if move_on_init:
-            self.servo.angle(init_angle)   # 초기 위치로 고정
+            self.servo.angle(init_angle)
 
-    def move_to(self, target, speed=30.0, step=1.0):
+    def move_to(self, target, speed=30.0, step=1.0, max_speed=40.0):
         """
         target: 목표 각도
-        speed: 초당 몇 도로 움직일지 (도/초). 낮을수록 느림
-        step: 한 번에 움직이는 각도 (작을수록 부드럽지만 통신량 증가)
+        speed: 초당 몇 도로 움직일지 (도/초)
+        step: 한 번에 움직이는 각도
+        max_speed: speed가 아무리 커도 이 값을 못 넘게 막는 상한선
         """
-        target = max(self.min_angle, min(self.max_angle, target))
-        delay = step / speed   # 스텝당 대기 시간
+        speed = min(speed, max_speed)                              # 속도 상한 제한
+        target = max(self.min_angle, min(self.max_angle, target))  # 각도 범위 제한
+        delay = step / speed
 
         direction = 1.0 if target > self.angle else -1.0
 
@@ -30,84 +38,32 @@ class SmoothJoint:
             self.servo.angle(self.angle)
             time.sleep(delay)
 
-        self.angle = target          # 남은 오차 마무리
+        self.angle = target
         self.servo.angle(self.angle)
         return self.angle
 
 
-def move_all(joints, targets, duration=2.0, steps=50):
+def move_all(joints, targets, max_speed=15.0, step_deg=1.0):
     """
     여러 관절을 동시에 움직임 (같이 출발해서 같이 도착)
-    joints: [j1, j2, j3, j4]
-    targets: [목표각도 4개]
-    duration: 전체 이동에 걸릴 시간(초)
+    max_speed: 가장 많이 움직이는 관절 기준, 초당 최대 이동 각도
+    step_deg: 한 조각당 이동 각도 (거리에 비례해 자동으로 조각 수 계산)
     """
     starts = [j.angle for j in joints]
+    max_distance = max(abs(e - s) for s, e in zip(starts, targets))
+
+    if max_distance == 0:
+        return
+
+    duration = max_distance / max_speed
+    steps = max(1, int(max_distance / step_deg))
     delay = duration / steps
 
     for i in range(steps + 1):
-        t = i / steps                        # 진행률 0.0 -> 1.0
+        t = i / steps
         for j, s, e in zip(joints, starts, targets):
-            a = s + (e - s) * t              # 선형 보간
+            a = s + (e - s) * t
             a = max(j.min_angle, min(j.max_angle, a))
             j.angle = a
             j.servo.angle(a)
         time.sleep(delay)
-
-
-# ================== 사용 예시 ==================
-if __name__ == "__main__":
-
-    reset_mcu()
-    time.sleep(1)
-    m1 = SmoothJoint("P0", init_angle=0)    # 베이스
-    m2 = SmoothJoint("P1", init_angle=0)    # 베이스
-    m3 = SmoothJoint("P2", init_angle=0)    # 베이스
-
-    j1 = SmoothJoint("P4", init_angle=0)    # 베이스
-    j2 = SmoothJoint("P5", init_angle=0)    # 어깨
-    j3 = SmoothJoint("P6", init_angle=0)   # 팔꿈치
-    j4 = SmoothJoint("P7", init_angle=0)    # 그리퍼
-    joints = [j1, j2, j3, j4]
-    time.sleep(1)
-
-    #초기화 
-    move_all(joints, [0, 0, 0, 0], duration=1.5)   # 안전하게 홈으로
-
-    time.sleep(1)
-
-    #for i in range(10): 
-    try:
-    	# 1) 관절 하나만 천천히
-        print("베이스 천천히 30도로")
-        #m1.move_to(0)      
-        #m2.move_to(0)      
-        #m3.move_to(0)      
-    	
-    	#집고 
-        #j4.move_to(-25, speed =11)
-
-        time.sleep(0.5)
-        
-        #들어올린다 
-        #j2.move_to(-50, speed = 11)    
-        
-        #j1.move_to(0)
-        #j3.move_to(0)    
-        
-        time.sleep(0.5)
-        
-        #print("베이스 빠르게 복귀")
-        #j1.move_to(0, speed=60)       # 초당 60도 -> 0.5초
-        
-        ## 2) 4개 관절 동시에 부드럽게
-        #print("전체 관절 동시 이동")
-        #move_all(joints, [20, 30, 60, 10], duration=2.0)
-        #time.sleep(0.5)
-        
-        #move_all(joints, [0, 0, 45, 0], duration=2.0)   # 홈 복귀
-
-    except KeyboardInterrupt:
-        print("중단")
-    #finally:
-	#move_all(joints, [0, 0, 0, -25], duration=1.5)   # 안전하게 홈으로

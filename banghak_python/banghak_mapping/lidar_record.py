@@ -73,7 +73,7 @@ class LidarLogger:
         os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
 
         log_dir = os.path.dirname(os.path.abspath(output_path)) or "."
-        cleanup_old_logs(log_dir, f"lidar_*.{fmt}", keep_last=5)
+        cleanup_old_logs(log_dir, f"lidar_*.{fmt}", keep_last=4)
 
     # ------------------------------------------------------------------
     # 종료 처리 (Ctrl+C 등)

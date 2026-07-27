@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>실시간 지도</title></head>
+<body style="margin:0;background:#1e1e1e;display:flex;justify-content:center;align-items:center;height:100vh;">
+  <div style="text-align:center;">
+    <img id="map" src="live_map.png" style="max-width:90vw;max-height:85vh;image-rendering:pixelated;border:1px solid #444;">
+    <p style="color:#aaa;font-family:sans-serif;">1초마다 자동 갱신됩니다</p>
+  </div>
+  <script>
+    setInterval(function () {
+      document.getElementById('map').src = 'live_map.png?' + Date.now();
+    }, 1000);
+  </script>
+</body></html>
