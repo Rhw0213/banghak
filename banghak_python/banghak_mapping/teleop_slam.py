@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 teleop_slam.py
+26.7.27
 ================
 4단계: 조종(teleop) + 라이다 실시간 SLAM(지도 그리기)을 동시에 돌려보는 단계.
 
@@ -27,6 +28,7 @@ teleop_slam.py
     logs/slam_map_latest.png            (몇 초마다 최신 지도로 덮어써서 저장 - 진행상황 확인용)
     logs/slam_map_YYYYmmdd_HHMMSS.png    (종료할 때 한 번 더, 타임스탬프 붙여서 최종본 보관)
     logs/slam_map_YYYYmmdd_HHMMSS.npy    (위 png와 같은 지도를, 6단계 A*에서 바로 쓸 숫자 배열로 저장)
+    logs/odom_debug.log                  (임시 디버그: 스캔마다 오도메트리 계산값과 추정 위치를 기록)
 
     * png와 npy 둘 다, 오래된 것은 자동으로 정리되어 최근 것만 남습니다
       (MAP_KEEP_LAST 값 참고 - 기본 5개).
@@ -38,39 +40,6 @@ teleop_slam.py
         pip install --break-system-packages Pillow
 
 ------------------------------------------------------------------------
-[중요: 이번 수정에서 실측(직접 측정)이 필요한 값 2개]
-
-  아래 "설정값 - 오도메트리 추정" 섹션에 있는
-      SPEED_MM_PER_SEC_AT_MAX
-      WHEEL_BASE_MM
-  두 값은 지금 임시 추정치가 들어있습니다. 실측하지 않아도 프로그램은 정상
-  동작하지만(에러 안 남), 값이 실제와 다르면 SLAM 위치추정 보정 효과가
-  떨어집니다. 정확도를 높이려면 아래 방법으로 꼭 실측해서 넣어주세요.
-
-  [1] SPEED_MM_PER_SEC_AT_MAX 재는 법 (차가 "최고속도"로 초당 몇 mm 가는지)
-      1. 바닥에 테이프나 표시로 출발선을 표시합니다.
-      2. w키를 눌러 차를 완전히 최고속도(SPEED_FAST가 MAX_SPEED=50에 도달)
-         상태로 만든 뒤, 그 상태를 정확히 3초간 유지하고 정지시킵니다.
-         (가속하는 구간은 최고속도가 아니므로 재는 구간에서 제외하는 셈치고,
-          "출발 직후 ~ 3초 후"로 넉넉히 재도 초반 오차는 크지 않습니다.
-          더 정확히 하려면 이미 최고속도로 달리고 있는 상태에서 스톱워치로
-          3초를 재고 그동안 이동한 거리만 줄자로 재는 방법을 추천합니다.)
-      3. 이동한 거리(mm)를 줄자로 잽니다. 예: 1500mm 이동했다면
-      4. 1500mm ÷ 3초 = 500mm/s  ->  이 값(500.0)을 SPEED_MM_PER_SEC_AT_MAX에 입력.
-      (단위는 "1초에 몇 mm 가는가" 입니다. "1mm당 값"이 아니라
-       "1초당 mm" 값이니 헷갈리지 않게 주의하세요.)
-
-  [2] WHEEL_BASE_MM 재는 법 (앞바퀴 축 중심 ~ 뒷바퀴 축 중심까지 거리)
-      1. 차량을 뒤집거나 옆에서 봐서, 앞바퀴 차축 중심선과 뒷바퀴 차축
-         중심선 사이의 직선 거리를 줄자로 잽니다. (좌우 폭이 아니라
-         앞뒤 길이 방향 거리입니다.)
-      2. 잰 값을 mm 단위로 그대로 WHEEL_BASE_MM에 입력합니다.
-         예: 13cm면 130.0을 입력.
-
-  실측 전까지는 코드 내 기본값(500.0mm/s, 130.0mm)이 임시로 쓰이며,
-  이 값들은 "안 넣는 것보다는 낫다" 수준의 대략치입니다.
-------------------------------------------------------------------------
-
 [팀원들을 위한 안내]
 이 파일은 여러 사람이 같이 보고 수정할 걸 감안해서, 웬만한 코드 블록마다
 "이게 왜 필요한지 / 뭘 하는지"를 주석으로 남겨뒀습니다. 코드를 고치실 때
@@ -79,7 +48,6 @@ teleop_slam.py
 """
 
 import curses
-import math
 import os
 import threading
 import time
@@ -108,10 +76,30 @@ except ImportError:
 MAX_SPEED = 50
 SPEED_STEP = 3
 
-STEER_LIMIT = 35
+STEER_LIMIT = 40   # lidar_ver2.py와 동일하게 맞춤 (기존 35 -> 40)
 STEER_STEP = 5
 
 KEY_REPEAT_TIMEOUT_MS = 100
+
+# lidar_ver2.py와 동일: 조향 방향이 반대로 나오면 True로 바꿔서 반전
+GAIN_REVERSE = False
+# lidar_ver2.py의 set_steer()에서 실제 서보에 보내기 직전 "+5"를 더하던 것과 동일한
+# 하드웨어 보정값. 서보의 물리적 중심(0도)이 실제 정중앙과 5도 어긋나 있다는 뜻이라,
+# 이 스크립트에서도 서보에 각도를 보낼 때 항상 이만큼 더해줍니다.
+STEER_HW_OFFSET_DEG = 5
+
+# odom_debug.log로 역산한 실제 직진 편향(트림). 조향각 0(직진 명령)을 줘도
+# 차량이 실제로는 약간 휘어져 가는 현상을, 서보에 이 각도만큼 미리 보정해서
+# 상쇄시킵니다.
+#
+# [주의] 이전에 딱 2개의 노이즈 낀 실측 지점만으로 멀리 외삽(extrapolate)해서
+# STEER_BIAS_DEG_BACKWARD=-6.1을 시도했더니, 실제로는 후진 시 반원을 그릴 정도로
+# 심하게 꺾여버렸습니다 (계산상 총 오프셋은 -1.1도로 작은 값이었는데도 실제
+# 물리적 반응은 그와 전혀 다르게 나타남 - 즉 이 정도 외삽은 신뢰할 수 없다는 뜻).
+# 그래서 후진 보정은 일단 보수적인 값으로 되돌리고, 여기서부터는 큰 폭으로
+# 점프하지 말고 ±1도 정도씩 소폭으로만 조정하며 재테스트하는 걸 권장합니다.
+STEER_BIAS_DEG_FORWARD = -1.5     # 전진 시 적용 (이전 테스트에서 개선 확인됨, 유지)
+STEER_BIAS_DEG_BACKWARD = 7.0   # 후진 시 적용 - 반대 방향으로 소폭 테스트 (0 -> -2.0)
 
 # ============================================================
 # 설정값 - 라이다 (lidar_ultra_avoidance.py / lidar_record.py와 동일)
@@ -133,35 +121,27 @@ LOAD_CHECK_EVERY_SEC = 2.0
 MAP_KEEP_LAST = 5
 
 # ============================================================
-# 설정값 - 오도메트리 추정 (SLAM 위치추정 보정용)
+# 설정값 - 디버그 로그 (오도메트리 검증용, 확인 끝나면 DEBUG_ODOM=False로 끄면 됨)
 # ============================================================
-# [실측 필요] SPEED_FAST가 최대값(MAX_SPEED)일 때, 차가 실제로 초당 몇 mm
-# 움직이는지를 나타냅니다. 단위는 "mm/초" 입니다.
-#
-# 왜 필요한가:
-#   원래 BreezySLAM은 slam.update(scan)만 호출하면, 로봇이 얼마나 움직였는지를
-#   순전히 "새 라이다 스캔을 기존 지도와 비교(스캔 매칭)"해서 추측합니다.
-#   그런데 차가 빠르게 움직이거나 주변에 벽/모서리 같은 특징이 부족한 구간을
-#   지나가면 이 추측이 크게 틀어질 수 있고, 그 결과로 이미 정확히 그려둔
-#   벽이 엉뚱하게 지워지거나 새 벽이 엉뚱한 위치에 찍히는 문제가 생깁니다.
-#   여기서는 "조종 중인 속도값(SPEED_FAST)"을 이 계수로 환산해서 대략적인
-#   이동거리 힌트(pose_change)를 SLAM에 함께 넘겨줘서, 위치추정이 스캔
-#   매칭에만 의존하지 않게 만듭니다. 정확하지 않은 대략값이어도 아예
-#   안 주는 것보다 SLAM 안정성이 훨씬 좋아집니다.
-#
-# [실측 방법] 파일 맨 위 docstring의 "[1] SPEED_MM_PER_SEC_AT_MAX 재는 법"
-# 항목을 참고해서 실측 후 아래 값을 교체하세요.
-# 예시 계산: 최고속도로 3초간 이동했더니 실제로 1500mm 이동했다면
-#            1500 / 3 = 500.0 을 입력하면 됩니다.
-SPEED_MM_PER_SEC_AT_MAX = 298.0   # <- [실측 전 임시값] 반드시 실측해서 교체하세요 (단위: mm/초)
+DEBUG_ODOM = True
+DEBUG_ODOM_PATH = os.path.join("logs", "odom_debug.log")
 
-# [실측 필요] 앞바퀴 차축 중심 ~ 뒷바퀴 차축 중심까지의 거리 (단위: mm).
-# 조향각(TARGET_STEER)으로 "지금 얼마나 빠르게 회전하고 있는지(회전각속도)"를
-# 추정하는 자전거 모델(bicycle model) 계산에 사용됩니다. 축간거리가 실제와
-# 다르면 회전량 추정이 부정확해지므로, 실측값을 넣어주는 게 좋습니다.
+# ============================================================
+# 설정값 - 좌우 모터 트림 보정 (물리적으로 확인됨: 조향 0에서도 차가 휘어짐)
+# ============================================================
+# 실측 결과, TARGET_STEER=0(직진)으로 몰아도 차가 한쪽으로 휘는 게 확인됐습니다
+# (양쪽 바퀴 실속도가 미세하게 다름). 여기서 한쪽 모터 속도를 살짝 줄이거나
+# 늘려서, 실제 물리적으로 양쪽 바퀴 속도가 같아지도록 보정합니다.
 #
-# [실측 방법] 파일 맨 위 docstring의 "[2] WHEEL_BASE_MM 재는 법" 항목 참고.
-WHEEL_BASE_MM = 97.0   # <- [실측 전 임시값] 반드시 실측해서 교체하세요 (단위: mm)
+# 1.0 = 보정 없음. 로그(odom_debug.log)에서 theta가 오른쪽(음수 방향)으로
+# 계속 틀어졌으니, 왼쪽 바퀴가 상대적으로 더 세게 밀고 있을 가능성이 높습니다.
+# -> 우선 LEFT_MOTOR_TRIM을 살짝 낮추는 쪽(예: 0.95)부터 시도해보세요.
+# 방향이 반대로 나오면(더 심하게 휘면) RIGHT_MOTOR_TRIM 쪽을 조정하는 걸로 바꾸면 됩니다.
+#
+# 튜닝 방법: 아래 값을 바꿔가며 직진 테스트 -> odom_debug.log에서
+# dtheta 누적(=theta 변화량)이 0에 가까워지는 값을 찾을 때까지 반복.
+LEFT_MOTOR_TRIM = 1.0    # 필요시 0.90~1.00 사이에서 조정
+RIGHT_MOTOR_TRIM = 1.0   # 필요시 1.00~1.10 사이에서 조정
 
 
 # ============================================================
@@ -219,8 +199,12 @@ def set_speed(left_motor, right_motor, target):
     elif SPEED_FAST > target:
         SPEED_FAST = max(SPEED_FAST - SPEED_STEP, target)
 
-    left_motor.speed(-SPEED_FAST)
-    right_motor.speed(SPEED_FAST)
+    # 좌우 트림 보정: SPEED_FAST(목표 반영값) 자체는 그대로 두고,
+    # 실제 모터에 넘기는 값에만 트림 비율을 곱합니다. 이렇게 하면
+    # 오도메트리 계산(estimate_pose_change)에 쓰이는 SPEED_FAST는
+    # 트림과 무관하게 "명령한 속도" 그대로 유지되어 계산이 헷갈리지 않습니다.
+    left_motor.speed(-SPEED_FAST * LEFT_MOTOR_TRIM)
+    right_motor.speed(SPEED_FAST * RIGHT_MOTOR_TRIM)
 
     if SPEED_FAST == 0:
         left_motor.speed(0)
@@ -229,8 +213,30 @@ def set_speed(left_motor, right_motor, target):
 
 
 def set_steer(steer_servo, angle):
+    """
+    조향 서보를 원하는 각도로 즉시 돌립니다.
+
+    [중요 - 2026-07-28 발견] 후진 중에는 조향각이 정확히 0에서 조금만 벗어나도
+    각도가 계속 커지며 발산(제자리에서 계속 도는 현상)하는 게 로그로 확인됐습니다.
+    앞바퀴 조향 차량은 원래 후진 시 "자기교정"이 아니라 "발산" 구조라서,
+    아주 작은 조향 오차도 시간이 갈수록 점점 커집니다 (233도까지 돌아버린 사례 있음).
+
+    그래서 STEER_HW_OFFSET_DEG(+5도, lidar_ver2.py 기준값)는 전진에만 적용합니다.
+    원본 lidar_ver2.py도 후진 시엔 이 set_steer()를 아예 안 쓰고 별도의
+    WallBackup 로직을 쓰기 때문에, +5도가 후진에서 검증된 적이 없는 값이었습니다.
+    후진 중에는 STEER_BIAS_DEG_BACKWARD만 적용하고, 이 값은 최대한 0에 가깝게
+    유지해야 합니다 (0이 아니면 발산 위험이 있으므로 아주 신중하게, 아주 작은
+    단위로만 조정하세요).
+    """
     angle = max(-STEER_LIMIT, min(STEER_LIMIT, angle))
-    steer_servo.angle(angle)
+    if GAIN_REVERSE:
+        angle = -angle
+
+    if SPEED_FAST >= 0:
+        steer_servo.angle(angle + STEER_HW_OFFSET_DEG + STEER_BIAS_DEG_FORWARD)
+    else:
+        # 후진: HW 오프셋 적용 안 함 (원본 코드도 후진엔 이 함수 자체를 안 씀)
+        steer_servo.angle(angle + STEER_BIAS_DEG_BACKWARD)
     return angle
 
 
@@ -254,16 +260,18 @@ def handle_key(key):
 # ============================================================
 # 라이다 스캔 -> BreezySLAM 입력 형식으로 변환
 # ============================================================
-def scan_to_distance_array(scan, scan_size):
+def scan_to_distance_array(scan, scan_size, min_quality=10):
     """
-    라이다 원본 스캔 [(quality, angle, distance_mm), ...]을
-    BreezySLAM이 요구하는 "0~359도, 360개짜리 거리 배열(mm)"로 변환.
-    LIDAR_OFFSET으로 기존 회피 코드와 동일한 방향 기준을 맞춥니다.
+    quality가 낮은 포인트(유리 반사, 노이즈 등으로 신뢰도 낮은 측정값)는
+    아예 배제해서, 지도에 엉뚱한 값이 찍히는 걸 줄입니다.
+    min_quality 값은 실제 데이터 보면서 조정이 필요할 수 있습니다.
     """
     distances = [0] * scan_size
 
     for quality, angle, distance in scan:
         if distance <= 0:
+            continue
+        if quality < min_quality:   # 신뢰도 낮은 포인트는 스킵
             continue
         corrected = (angle + LIDAR_OFFSET) % 360
         index = int(corrected) % scan_size
@@ -271,34 +279,30 @@ def scan_to_distance_array(scan, scan_size):
 
     return distances
 
+import math   # 파일 상단 import 구역에 추가 필요
 
-# ============================================================
-# 오도메트리(이동량) 추정
-# ============================================================
+# 오도메트리 디버그 로그(odom_debug.log)로 역산한 실측 보정값입니다.
+# (기존 SPEED_MM_PER_SEC_AT_MAX=333.0 하나로 전진/후진을 같이 계산했더니
+#  전진은 83.6%, 후진은 62.8%만 맞아서, 전진/후진을 따로 분리했습니다.
+#  기어 백래시나 모터 특성 차이로 후진이 전진보다 실제 속도가 느린 걸로 보입니다.)
+SPEED_MM_PER_SEC_AT_MAX_FORWARD = 226    # 전진 최고속도(mm/s), 로그 기반 보정값
+SPEED_MM_PER_SEC_AT_MAX_BACKWARD = 209.1   # 후진 최고속도(mm/s), 로그 기반 보정값
+WHEEL_BASE_MM = 97.0              # 실측 완료
+
 def estimate_pose_change(dt):
-    """
-    직전 스캔 처리 이후 흐른 시간(dt, 초) 동안 로봇이 대략 얼마나 움직였는지를
-    "현재 조종 중인 속도(SPEED_FAST)와 조향각(TARGET_STEER)"으로부터 추정합니다.
+    # SPEED_FAST 부호로 전진/후진을 구분해서 서로 다른 속도 상수를 적용
+    if SPEED_FAST >= 0:
+        max_speed_mm_s = SPEED_MM_PER_SEC_AT_MAX_FORWARD
+    else:
+        max_speed_mm_s = SPEED_MM_PER_SEC_AT_MAX_BACKWARD
 
-    반환값: (dxy_mm, dtheta_deg, dt)
-        - dxy_mm     : 추정 이동 거리 (mm)
-        - dtheta_deg : 추정 회전각 (도, +는 한쪽 방향 회전)
-        - dt         : 그대로 전달 (BreezySLAM이 요구하는 형식)
-
-    이 값은 정확한 엔코더 기반 오도메트리가 아니라 "대략적인 힌트"입니다.
-    SPEED_MM_PER_SEC_AT_MAX와 WHEEL_BASE_MM을 실측할수록 정확해집니다.
-    (자세한 실측 방법은 파일 맨 위 docstring 참고)
-    """
-    # 1) 현재 속도(SPEED_FAST, 0~MAX_SPEED 범위)를 실제 mm/s로 환산
     if MAX_SPEED:
-        speed_mm_s = (SPEED_FAST / MAX_SPEED) * SPEED_MM_PER_SEC_AT_MAX
+        speed_mm_s = (SPEED_FAST / MAX_SPEED) * max_speed_mm_s
     else:
         speed_mm_s = 0.0
 
     dxy_mm = speed_mm_s * dt
 
-    # 2) 자전거 모델(bicycle model)로 조향각 -> 회전각속도 근사 계산
-    #    조향각이 0(직진)이면 회전량도 0.
     steer_rad = math.radians(TARGET_STEER)
     if WHEEL_BASE_MM > 0 and abs(steer_rad) > 1e-6:
         turn_rate_deg_s = math.degrees(
@@ -311,7 +315,6 @@ def estimate_pose_change(dt):
 
     return dxy_mm, dtheta_deg, dt
 
-
 # ============================================================
 # SLAM + 라이다 기록 스레드
 # ============================================================
@@ -319,15 +322,14 @@ def slam_worker():
     """
     백그라운드 스레드. 라이다에 연결해서 스캔이 들어올 때마다 SLAM을 갱신하고,
     주기적으로 지도 저장 + 시스템 부하 측정을 합니다.
-
-    [수정 사항] slam.update() 호출 시 pose_change(오도메트리 힌트)를 함께
-    넘겨줘서, 위치추정이 라이다 스캔 매칭에만 의존하지 않도록 개선했습니다.
-    이렇게 하면 차가 움직일 때 이미 그려둔 벽이 잘못 지워지거나 엉뚱한
-    위치에 새 벽이 찍히는 문제가 줄어듭니다. (원리는 estimate_pose_change
-    함수 주석과 파일 맨 위 docstring 참고)
     """
     laser = LaserModel()
-    slam = RMHC_SLAM(laser, MAP_SIZE_PIXELS, MAP_SIZE_METERS)
+    slam = RMHC_SLAM(
+        laser, MAP_SIZE_PIXELS, MAP_SIZE_METERS,
+        hole_width_mm=1000,
+        sigma_xy_mm=100,          # 기본값 100mm -> 200mm로 조금 넓힘
+        sigma_theta_degrees=20,   # 기본값 20도 -> 30도로 조금 넓힘
+    )
 
     mapbytes = bytearray(MAP_SIZE_PIXELS * MAP_SIZE_PIXELS)
 
@@ -336,6 +338,16 @@ def slam_worker():
     # 이전 실행에서 남은 오래된 지도 파일 정리 (png/npy 둘 다, 최근 MAP_KEEP_LAST개만 남김)
     cleanup_old_logs("logs", "slam_map_2*.png", keep_last=MAP_KEEP_LAST)
     cleanup_old_logs("logs", "slam_map_2*.npy", keep_last=MAP_KEEP_LAST)
+
+    # ---- 디버그 로그 파일 준비 (오도메트리 검증용) ----
+    # 매번 실행할 때마다 이전 로그는 지우고 새로 시작합니다 (누적 안 함).
+    # 예전엔 "a"(이어붙이기)라서 실행할수록 파일이 계속 길어져서 스크롤이
+    # 불편했는데, 여기서 "w"(덮어쓰기)로 바꿔서 매 실행 시작 시 파일을 비웁니다.
+    if DEBUG_ODOM:
+        with open(DEBUG_ODOM_PATH, "w", encoding="utf-8") as f:
+            f.write(f"===== 새 실행 시작: {datetime.now().isoformat(timespec='seconds')} "
+                    f"(FWD={SPEED_MM_PER_SEC_AT_MAX_FORWARD}, BACK={SPEED_MM_PER_SEC_AT_MAX_BACKWARD}, "
+                    f"sigma_xy_mm={slam.sigma_xy_mm}, sigma_theta_degrees={slam.sigma_theta_degrees}) =====\n")
 
     try:
         lidar = RPLidar(LIDAR_PORT)
@@ -348,7 +360,10 @@ def slam_worker():
 
     last_map_save = 0.0
     last_load_check = 0.0
-    last_scan_time = None   # 직전 스캔을 처리한 시각 (오도메트리 dt 계산용)
+    last_scan_time = None
+
+    # 디버그용: 오도메트리가 계산한 dxy_mm을 누적해서 "이론상 이동거리 합계"를 같이 봄
+    cumulative_dxy_mm = 0.0
 
     try:
         for scan in lidar.iter_scans(min_len=60):
@@ -358,16 +373,14 @@ def slam_worker():
             distances_mm = scan_to_distance_array(scan, laser.scan_size)
 
             now_scan = time.time()
-
             if last_scan_time is None:
-                # 첫 스캔은 "직전 시각"이 없어서 이동량(dt)을 계산할 수 없으므로
-                # 오도메트리 힌트 없이 첫 위치만 잡습니다.
+                # 첫 스캔은 직전 시각이 없어서 이동량 계산 불가 -> 힌트 없이 위치만 잡음
                 slam.update(distances_mm)
+                dxy_mm, dtheta_deg, dt = 0.0, 0.0, 0.0
             else:
                 dt = now_scan - last_scan_time
                 dxy_mm, dtheta_deg, dt = estimate_pose_change(dt)
                 slam.update(distances_mm, pose_change=(dxy_mm, dtheta_deg, dt))
-
             last_scan_time = now_scan
 
             x_mm, y_mm, theta_deg = slam.getpos()
@@ -377,6 +390,22 @@ def slam_worker():
 
             scan_id += 1
             slam_status["scan_count"] = scan_id
+
+            # ---- 디버그 로그 기록 ----
+            # 스캔마다: 그 순간 속도값/조향값, 계산된 dt/dxy/dtheta, 그리고 SLAM이
+            # 최종적으로 내놓은 추정 위치(pos)를 한 줄씩 남깁니다.
+            # cumulative_dxy_mm은 "오도메트리 계산만 따라가면 총 몇 mm 이동한 것으로
+            # 나오는지"를 보여줘서, 실제 SLAM 위치 변화량과 비교하기 위한 값입니다.
+            if DEBUG_ODOM:
+                cumulative_dxy_mm += dxy_mm
+                with open(DEBUG_ODOM_PATH, "a", encoding="utf-8") as f:
+                    f.write(
+                        f"scan={scan_id:5d} "
+                        f"SPEED_FAST={SPEED_FAST:4d} TARGET_STEER={TARGET_STEER:4d} "
+                        f"dt={dt:.3f} dxy_mm={dxy_mm:7.2f} dtheta_deg={dtheta_deg:7.2f} "
+                        f"누적dxy_mm={cumulative_dxy_mm:9.1f} "
+                        f"pos=(x={x_mm:.1f}, y={y_mm:.1f}, theta={theta_deg:.1f})\n"
+                    )
 
             now = time.time()
 
@@ -462,6 +491,8 @@ def main(stdscr):
     safe_addstr(stdscr, 1, 0, "w: 전진  s: 후진  a: 좌회전  d: 우회전")
     safe_addstr(stdscr, 2, 0, "x: 조향 정면복귀  space: 정지  q: 종료")
     safe_addstr(stdscr, 3, 0, "-" * 55)
+    if DEBUG_ODOM:
+        safe_addstr(stdscr, 4, 0, f"[디버그 로그 켜짐] -> {DEBUG_ODOM_PATH}")
 
     try:
         while True:

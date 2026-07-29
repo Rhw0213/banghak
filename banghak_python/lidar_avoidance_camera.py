@@ -37,7 +37,6 @@ SPEED_BACK = 0              # 후진용 슬로우스타터 (picarx, wallBackup�
 SPEED_SLOW = VELOCITY / 2
 
 SPEED_STEP = 3              # 가감속 스텝
-
 SCAN_MIN_LEN = 60
 
 
@@ -167,11 +166,11 @@ def main():
         SPEED_BACK = min(SPEED_BACK + SPEED_STEP, target)
         return SPEED_BACK
 
-    def back_decre_Move(target=0):
-        """후진 duty를 SPEED_STEP만큼 감소"""
-        global SPEED_BACK
-        SPEED_BACK = max(SPEED_BACK - SPEED_STEP, target)
-        return SPEED_BACK
+    # def back_decre_Move(target=0):
+    #     """후진 duty를 SPEED_STEP만큼 감소"""
+    #     global SPEED_BACK
+    #     SPEED_BACK = max(SPEED_BACK - SPEED_STEP, target)
+    #     return SPEED_BACK
 
     def set_steer(angle):
         angle = max(-STEER_LIMIT, min(STEER_LIMIT, angle))
