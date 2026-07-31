@@ -59,7 +59,7 @@ REAR_SAFETY_MARGIN_CM = 11
 DEFAULT_BACK_TARGET_CM = 60
 
 # 속도
-# VELOCITY = 60
+# VELOCITY = 40
 VELOCITY = 0
 SPEED_FAST = 0
 SPEED_BACK = 0
@@ -84,27 +84,42 @@ LOAD_WARN_RATIO = 1.0             # 1분 평균 부하가 (코어 수 * 이 값)
 CAM_WIDTH = 320             # 라즈베리파이4에서 라이다와 병행하려면 320x240 권장
 CAM_HEIGHT = 240
 CAM_FORMAT = "RGB888"       # picamera2에서 이 이름은 실제로 BGR 순서로 나옴(주의)
-CAM_TILT_ANGLE = -15
+CAM_TILT_ANGLE = 10        # 카메라 고개 들기
 CAM_SWAP_RB = False         # 스트림에서 노란 물체가 파랗게 보이면 웹 UI로 토글
 
 # 노란색 HSV 범위 (OpenCV H는 0~179). 웹 UI 슬라이더로 실시간 변경 가능.
-# COLOR_H_MIN, COLOR_H_MAX = 20, 35
-# COLOR_S_MIN, COLOR_S_MAX = 100, 255
-# COLOR_V_MIN, COLOR_V_MAX = 100, 255
+COLOR_H_MIN, COLOR_H_MAX = 20, 35
+COLOR_S_MIN, COLOR_S_MAX = 100, 255
+COLOR_V_MIN, COLOR_V_MAX = 100, 255
 
 # 파란색 코드
-COLOR_H_MIN, COLOR_H_MAX = 95, 130
-COLOR_S_MIN, COLOR_S_MAX = 100, 255
-COLOR_V_MIN, COLOR_V_MAX = 60, 255
+# COLOR_H_MIN, COLOR_H_MAX = 100, 125
+# COLOR_S_MIN, COLOR_S_MAX = 60, 255
+# COLOR_V_MIN, COLOR_V_MAX = 40, 255
 
 MIN_TARGET_AREA = 400
 
 # 거리 추정 (핀홀 모델): 거리cm = (실제폭cm * focal_px) / 화면폭px
 TARGET_REAL_WIDTH_CM = 6.5  # ★ 본인 오브젝트 실제 가로폭으로 수정
-CAM_FOCAL_PX = 330.0        # ★ 반드시 캘리브레이션 필요 (해상도 바꾸면 재측정)
+CAM_FOCAL_PX = 528.0        # ★ 반드시 캘리브레이션 필요 (해상도 바꾸면 재측정)
 
 ARRIVE_DISTANCE_CM = 10     # 이 거리 + 화면 중앙 정렬되면 도착 처리
 ARRIVE_CENTER_TOL = 0.15    # 도착 판정용 중앙 정렬 허용 오프셋
+
+
+# ===== [로봇팔 추가] 픽업 서보 설정 =====
+ARM_HOME_SHOULDER = 0
+ARM_HOME_ELBOW = 0
+ARM_GRAB_OPEN = 0
+
+ARM_PICK_SHOULDER = -40   # ★ arm_calib.py로 실측 후 교체
+ARM_PICK_ELBOW = 20       # ★ arm_calib.py로 실측 후 교체
+ARM_GRAB_CLOSE = 0       # ★ arm_calib.py로 실측 후 교체
+
+ARM_MOVE_DELAY = 0.5
+
+ARM_STEP_DEG = 2         # 한 번에 움직이는 각도 (작을수록 부드러움)
+ARM_STEP_DELAY = 0.02    # 각 스텝 사이 대기시간(초) - 작을수록 빠름
 
 APPROACH_SPEED = 20
 TARGET_STEER_GAIN = 30.0    # 화면 오프셋(-1~+1) -> 조향각 변환 계수 (핵심)
@@ -840,9 +855,9 @@ def mission_step(ultra_cm, lidar_min):
     # # 0730 - 12:16 / 추가
     # 3순위: 정상 접근 - 목표물 발견 시 속도 절반으로 감속 + 화면 오프셋으로 조향
     steer = max(-STEER_LIMIT, min(STEER_LIMIT, target.offset * TARGET_STEER_GAIN))
-    speed = max(1, int(VELOCITY * 0.5))   # ★ 목표물 발견 -> 항상 절반 속도
+    speed = max(1, int(VELOCITY * 0.7))   # ★ 목표물 발견 -> 항상 절반 속도
     if 0 < ultra_cm < 30:
-        speed = max(12, int(APPROACH_SPEED * 0.3))  # 더 가까워지면 한 번 더 감속(선택)
+        speed = max(18, int(APPROACH_SPEED * 0.5))  # 더 가까워지면 한 번 더 감속(선택)
 
     return Command(handled=True, speed=speed, steer=steer, allow_backup=False,
                    state=APPROACH,
@@ -878,6 +893,47 @@ def calibrate_vision():
         stop_vision()
         print("종료")
 
+# 로봇팔 픽업 함수
+def pick_up_target(shoulder_servo, elbow_servo, grab_servo):
+    """ARRIVED 상태에서 한 번 호출: 그립 열고 -> 팔 내리기 -> 그립 닫기 -> 팔 복귀 (부드럽게)"""
+    print("[로봇팔] 픽업 시퀀스 시작")
+
+    smooth_servo_move(grab_servo, ARM_GRAB_OPEN, ARM_GRAB_CLOSE)
+    time.sleep(ARM_MOVE_DELAY)
+
+    smooth_servo_move(shoulder_servo, ARM_PICK_SHOULDER, ARM_HOME_SHOULDER)
+    smooth_servo_move(elbow_servo, ARM_PICK_ELBOW, ARM_HOME_ELBOW)
+    time.sleep(ARM_MOVE_DELAY)
+
+    smooth_servo_move(grab_servo, ARM_GRAB_CLOSE, ARM_GRAB_OPEN)
+    time.sleep(ARM_MOVE_DELAY)
+
+    smooth_servo_move(shoulder_servo, ARM_HOME_SHOULDER, ARM_PICK_SHOULDER)
+    smooth_servo_move(elbow_servo, ARM_HOME_ELBOW, ARM_PICK_ELBOW)
+    time.sleep(ARM_MOVE_DELAY)
+
+    print("[로봇팔] 픽업 시퀀스 완료")
+
+# 팔 움직임 부드럽게
+def smooth_servo_move(servo, target_angle, current_angle,
+                       step_deg=ARM_STEP_DEG, step_delay=ARM_STEP_DELAY):
+    """
+    서보를 current_angle에서 target_angle까지 조금씩 나눠서 이동.
+    끝나면 실제로 도달한 각도(target_angle)를 반환 -> 다음 호출의 current_angle로 사용
+    """
+    if current_angle < target_angle:
+        angle = current_angle
+        while angle < target_angle:
+            angle = min(angle + step_deg, target_angle)
+            servo.angle(angle)
+            time.sleep(step_delay)
+    else:
+        angle = current_angle
+        while angle > target_angle:
+            angle = max(angle - step_deg, target_angle)
+            servo.angle(angle)
+            time.sleep(step_delay)
+    return target_angle
 
 # =========================================================================
 # ===== 기존 라이다 유틸 (로직 변경 없음) =====
@@ -985,6 +1041,15 @@ def main():
     right_motor = Motor(PWM("P12"), Pin("D5"))
     steer = Servo("P2")
 
+    # 로봇팔 핀번호 
+    arm_shoulder = Servo("P5")
+    arm_elbow = Servo("P6")
+    arm_grab = Servo("P7")
+    arm_shoulder.angle(ARM_HOME_SHOULDER)
+    arm_elbow.angle(ARM_HOME_ELBOW)
+    arm_grab.angle(ARM_GRAB_OPEN)
+
+
     sonar = Ultrasonic(Pin("D2"), Pin("D3"))
     lidar = connect_lidar(LIDAR_PORT)
 
@@ -1065,7 +1130,8 @@ def main():
     isBackFlag = False
     BACK_TARGET = VELOCITY * 0.65
 
-    backSpeed = 20 * (50 / BACK_TARGET)
+    # backSpeed = 20 * (50 / BACK_TARGET)
+    backSpeed = 20 * (50 / BACK_TARGET) if BACK_TARGET != 0 else 0
     current_backSpeed = backSpeed
     steel_gain_result = 0
 
@@ -1132,9 +1198,15 @@ def main():
                     update_telemetry(state=ARRIVED, reason=cmd.reason,
                                      ultra_cm=float(ultra_cm), lidar_mm=float(lidar_min),
                                      speed=0, steer=0.0)
+                    # if not _arrived_notified:
+                    #     print(f"★ 미션 완료: {cmd.reason} - 모터 정지 후 대기 중 (Ctrl+C로 종료)")
+                    #     _arrived_notified = True
+                    # continue
                     if not _arrived_notified:
-                        print(f"★ 미션 완료: {cmd.reason} - 모터 정지 후 대기 중 (Ctrl+C로 종료)")
                         _arrived_notified = True
+                        print(f"★ 미션 완료: {cmd.reason} - 로봇팔 픽업 시작")
+                        pick_up_target(arm_shoulder, arm_elbow, arm_grab)
+                        print("★★★ 픽업 완료 - 대기 중 (Ctrl+C로 종료) ★★★")
                     continue
 
 
@@ -1264,6 +1336,19 @@ def main():
         set_speed(0)
         set_steer(0)
         wallBackup.stop(0)
+
+        # ===== [로봇팔 추가] 종료 시 팔을 0도로 초기화 =====
+        try:
+            print("[로봇팔] 종료 - 초기 위치(0도)로 복귀 중...")
+            arm_shoulder.angle(ARM_HOME_SHOULDER)
+            arm_elbow.angle(ARM_HOME_ELBOW)
+            arm_grab.angle(ARM_GRAB_OPEN)
+            time.sleep(ARM_MOVE_DELAY * 1.5)
+            print("[로봇팔] 초기 위치 복귀 완료")
+        except Exception as e:
+            print(f"[로봇팔] 종료 시 초기화 실패: {e}")
+        # ===== [로봇팔 추가] 끝 =====
+
         stop_stream()              # ===== [스트리밍 추가] =====
         stop_vision()              # ===== [비전 추가] =====
         lidar.stop()

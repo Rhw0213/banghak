@@ -91,6 +91,44 @@ def simplify_waypoints(points_mm, min_gap_mm):
 # 위치추적 전용 스레드: SLAM으로 새 지도를 만드는 대신, 이미 저장된 지도
 # (map_array)와 매 스캔을 직접 비교해서 계속 위치를 다시 찾습니다.
 # ============================================================
+def connect_lidar_with_retry(port, max_retries=5):
+    """
+    lidar_ultra_vision.py의 connect_lidar()와 동일한 패턴: 연결 -> stop/reset ->
+    안정화 대기 -> health 확인까지 통째로 재시도합니다. 단순히 스캔
+    제너레이터만 새로 만드는 것보다 훨씬 확실하게 연결 자체를 리셋합니다.
+    """
+    for attempt in range(1, max_retries + 1):
+        lidar = None
+        try:
+            lidar = ts.RPLidar(port)
+            try:
+                lidar.stop()
+                lidar.stop_motor()
+            except Exception:
+                pass
+            time.sleep(0.3)
+            try:
+                lidar.reset()
+            except Exception:
+                pass
+            time.sleep(1.5)
+            try:
+                lidar._serial.reset_input_buffer()
+            except Exception:
+                pass
+            lidar.get_health()   # 여기서 실패하면 아래 except로 넘어가 재시도
+            return lidar
+        except Exception as e:
+            if lidar is not None:
+                try:
+                    lidar.disconnect()
+                except Exception:
+                    pass
+            if attempt < max_retries:
+                time.sleep(1.5)
+    return None
+
+
 def tracking_worker(map_array, num_init_scans, search_range_m, xy_step_mm,
                      angle_step_deg, score_warn_threshold):
     """
@@ -110,43 +148,17 @@ def tracking_worker(map_array, num_init_scans, search_range_m, xy_step_mm,
     dist_transform = build_distance_transform(map_array)
     ts.slam_status["initial_fix_done"] = False
 
-    try:
-        lidar = ts.RPLidar(ts.LIDAR_PORT)
-    except Exception as e:
-        ts.slam_status["last_error"] = f"라이다 연결 실패: {e}"
+    lidar = connect_lidar_with_retry(ts.LIDAR_PORT)
+    if lidar is None:
+        ts.slam_status["last_error"] = "라이다 연결 실패 (재시도 5회 모두 실패)"
         return
-
-    # ---- teleop_slam.py(디버그 버전)와 동일한 안정화 절차 ----
-    # "many values to unpack" 같은 통신 오류는 라이다 내부 MCU가 이전 실행의
-    # 영향으로 이상한 상태에 갇혀있을 때 흔히 발생합니다. reset()으로 강제
-    # 초기화하고, 재부팅 시간을 준 뒤, 입력 버퍼도 비우고 시작합니다.
-    try:
-        lidar.reset()
-    except Exception:
-        pass
-    time.sleep(2.0)
-    try:
-        lidar._serial.reset_input_buffer()
-    except Exception:
-        pass
-
-    def _try_with_retry(func, retries=2, delay=0.5):
-        for attempt in range(retries):
-            try:
-                return func()
-            except Exception:
-                if attempt < retries - 1:
-                    time.sleep(delay)
-        return None
-
-    _try_with_retry(lidar.get_info)
-    _try_with_retry(lidar.get_health)
 
     ts.slam_status["connected"] = True
     scan_id = 0
     current_x, current_y, current_theta = 0.0, 0.0, 0.0
     init_angles_list, init_distances_list = [], []
     skip_count = 0
+    consecutive_fail = 0
 
     scan_iter = lidar.iter_scans(min_len=60)
 
@@ -199,33 +211,71 @@ def tracking_worker(map_array, num_init_scans, search_range_m, xy_step_mm,
                 ts.slam_status["robot_x_mm"] = current_x
                 ts.slam_status["robot_y_mm"] = current_y
                 ts.slam_status["robot_theta_deg"] = current_theta
+                consecutive_fail = 0
 
             except StopIteration:
                 break
             except ts.RPLidarException as e:
                 skip_count += 1
-                ts.slam_status["last_error"] = f"라이다 통신 오류(스캔 건너뜀, 누적 {skip_count}회): {e}"
+                consecutive_fail += 1
+                cable_hint = "  <-- 계속 실패 중, USB 케이블/커넥터 확인해보세요!" if consecutive_fail >= 100 else ""
+                ts.slam_status["last_error"] = (
+                    f"라이다 통신 오류(스캔 건너뜀, 누적 {skip_count}회, 연속 {consecutive_fail}회): {e}{cable_hint}")
                 # 제너레이터는 한 번 예외를 던지면 그 객체 자체가 끝나버려서(파이썬
                 # 기본 동작), 그대로 두면 다음 next() 호출에서 계속 StopIteration만
-                # 나며 조용히 루프가 끝나버립니다. 새로 다시 만들어서 이어갑니다.
-                try:
-                    scan_iter = lidar.iter_scans(min_len=60)
-                except Exception:
-                    pass
+                # 나며 조용히 루프가 끝나버립니다. 가벼운 경우는 제너레이터만
+                # 새로 만들고, 30번 연속 실패처럼 심한 경우는 lidar_ultra_vision.py의
+                # connect_lidar()처럼 연결 자체를 완전히 끊었다 재연결합니다
+                # (제너레이터만 새로 만드는 것보다 훨씬 확실하게 리셋됨).
+                if consecutive_fail % 30 == 0:
+                    ts.slam_status["last_error"] += "  (라이다 완전 재연결 시도 중...)"
+                    try:
+                        lidar.disconnect()
+                    except Exception:
+                        pass
+                    new_lidar = connect_lidar_with_retry(ts.LIDAR_PORT)
+                    if new_lidar is not None:
+                        lidar = new_lidar
+                        scan_iter = lidar.iter_scans(min_len=60)
+                    else:
+                        ts.slam_status["last_error"] = "라이다 재연결 실패 - 케이블/전원 확인 필요"
+                else:
+                    try:
+                        scan_iter = lidar.iter_scans(min_len=60)
+                    except Exception:
+                        pass
+                time.sleep(0.02)   # 통신이 계속 불안정할 때 CPU를 100% 갈아먹지 않도록 살짝 쉼
                 continue
             except Exception as e:
                 # "many values to unpack" 등 라이다 라이브러리 내부의 일시적 파싱
                 # 오류 - 스캔을 가져오는 단계뿐 아니라, 가져온 스캔 안의 개별
                 # 포인트를 처리하는 단계나 localize() 계산 중에 나는 오류까지
                 # 전부 여기서 잡아서, 그 스캔 한 번만 건너뛰고 스레드는 계속
-                # 살려둡니다. (제너레이터 재생성 이유는 위 주석과 동일)
+                # 살려둡니다. (재연결 전략은 위 RPLidarException 처리와 동일)
                 skip_count += 1
+                consecutive_fail += 1
+                cable_hint = "  <-- 계속 실패 중, USB 케이블/커넥터 확인해보세요!" if consecutive_fail >= 100 else ""
                 ts.slam_status["last_error"] = (
-                    f"스캔 처리 오류(건너뜀, 누적 {skip_count}회): {type(e).__name__}: {e}")
-                try:
-                    scan_iter = lidar.iter_scans(min_len=60)
-                except Exception:
-                    pass
+                    f"스캔 처리 오류(건너뜀, 누적 {skip_count}회, 연속 {consecutive_fail}회): "
+                    f"{type(e).__name__}: {e}{cable_hint}")
+                if consecutive_fail % 30 == 0:
+                    ts.slam_status["last_error"] += "  (라이다 완전 재연결 시도 중...)"
+                    try:
+                        lidar.disconnect()
+                    except Exception:
+                        pass
+                    new_lidar = connect_lidar_with_retry(ts.LIDAR_PORT)
+                    if new_lidar is not None:
+                        lidar = new_lidar
+                        scan_iter = lidar.iter_scans(min_len=60)
+                    else:
+                        ts.slam_status["last_error"] = "라이다 재연결 실패 - 케이블/전원 확인 필요"
+                else:
+                    try:
+                        scan_iter = lidar.iter_scans(min_len=60)
+                    except Exception:
+                        pass
+                time.sleep(0.02)
                 continue
 
     except ts.RPLidarException as e:

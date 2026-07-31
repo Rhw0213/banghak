@@ -1,26 +1,27 @@
 """
-robot_pick.py
-역할: 카메라 인식(실시간 스트리밍 포함) + 차량 이동/정지 + 로봇팔 제어 통합
+robot_pick_J.py
+역할: 카메라 인식(바운딩 박스 + 실시간 스트리밍) + 차량 이동/정지(부드러운 연속 가속) + 로봇팔 제어
 
 흐름:
-1. 차량이 전진하며 카메라로 파란색(가벼운) 물체를 찾음
-2. 물체가 감지되고, 추정 거리가 STOP_DISTANCE_CM 이하로 가까워지면 차량 정지
+1. 차량이 부드럽게 서서히 가속하며 전진, 카메라로 파란색 물체를 찾음
+2. 파란색이 감지되는 순간 -> 거리를 4cm로 간주하고 즉시 정지
 3. 팔이 내려가 그리퍼로 물체를 집음
-4. 집은 채로 팔을 원위치(빠꾸)로 이동
+4. 집은 채로 팔을 원위치(빠꾸)로 이동 + 차량 자체도 실제로 후진
 
-실시간 스트리밍:
-- 브라우저에서 http://<라즈베리파이_IP>:8000 접속 시 실시간 영상 확인 가능
-- 필요 패키지: pip install flask picamera2 (picamera2는 라즈베리파이 OS에 보통 기본 설치됨)
+실행 전 반드시 확인:
+    ps aux | grep python3        # 이전에 안 죽은 프로세스 있는지 확인
+    pkill -9 -f robot_pick       # 있으면 강제 종료
+    sudo lsof /dev/video0        # 카메라 점유 프로세스 없는지 확인
 
-카메라 관련 중요 참고:
-- cv2.VideoCapture(0)는 CSI 카메라 + libcamera 스택 환경에서 프레임을 못 읽는 경우가 많음
-  (V4L2 레거시 방식과 libcamera 방식이 안 맞아서 발생하는 문제)
-- 그래서 Picamera2로 프레임을 받아온 뒤 OpenCV용으로 BGR 변환해서 사용
+실시간 스트리밍: http://192.168.0.82:8000
+종료 방법: 터미널에서 'q' + Enter, 또는 Ctrl+C (둘 다 모터를 반드시 정지시킴)
 """
 
 import os
+import signal
 import threading
 import time
+import traceback
 
 import cv2
 import numpy as np
@@ -32,7 +33,20 @@ from robot_hat import Servo, device  # reset_mcu() deprecated -> device.reset_mc
 
 
 # ============================================================
-# 1. CAMERA - 물체의 색 인식 (파란색)
+# 0. 공유 상태 (카메라 스레드 <-> 제어 스레드 <-> Flask가 함께 사용)
+# ============================================================
+
+state_lock = threading.Lock()
+shared = {
+    "frame": None,       # 스트리밍용 최신 프레임 (바운딩 박스 그려짐)
+    "detected": False,   # 파란 물체 감지 여부
+    "area": 0,           # 감지된 영역 픽셀 면적
+    "picked": False,     # 집기 완료 여부
+}
+
+
+# ============================================================
+# 1. CAMERA - 파란색 물체 인식 (바운딩 박스로 물체 전체를 감쌈)
 # ============================================================
 
 """
@@ -40,128 +54,88 @@ from robot_hat import Servo, device  # reset_mcu() deprecated -> device.reset_mc
 
 RED_LOWER1 = np.array([0, 100, 100])
 RED_UPPER1 = np.array([10, 255, 255])
-
 RED_LOWER2 = np.array([170, 100, 100])
 RED_UPPER2 = np.array([179, 255, 255])
-
-def detect_red_object(frame):
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    mask1 = cv2.inRange(hsv, RED_LOWER1, RED_UPPER1)
-    mask2 = cv2.inRange(hsv, RED_LOWER2, RED_UPPER2)
-    mask = cv2.bitwise_or(mask1, mask2)  # 두 마스크를 합침
-    # 이후 로직은 detect_yellow_object와 동일 (contour 찾기 등)
 """
 
 BLUE_LOWER = np.array([90, 100, 100])
 BLUE_UPPER = np.array([130, 255, 255])
 
-"""
-다른 HSV 범위 (실제 조명/물체에 맞춰 반드시 튜닝 필요) 아래는 예시
-YELLOW_LOWER = np.array([20, 100, 100])
-YELLOW_UPPER = np.array([35, 255, 255])
-
-주황    10~20
-노랑    20~35
-초록    35~85
-파랑    90~130
-보라    130~160
-이는 HSV 중 H에 해당되는 사항이다
-"""
-
-MIN_AREA = 500  # 이보다 작은 영역은 노이즈로 간주하고 무시
+MIN_AREA = 300  # 이보다 작은 영역은 노이즈로 간주 (기존 500 -> 낮춤, 필요시 조정)
 
 
 def detect_blue_object(frame):
     """
-    입력: BGR 프레임
-    출력: (detected, cx, cy, area)
+    입력: BGR 프레임 (Picamera2의 'RGB888' 포맷은 실제로 이미 BGR 순서라 별도 변환 불필요)
+    출력: (detected, x, y, w, h, area)
+        x, y, w, h: 물체 전체를 감싸는 바운딩 박스 좌표 (YOLO 박스처럼 표시하기 위함)
     """
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, BLUE_LOWER, BLUE_UPPER)
 
+    # 작은 노이즈 점들 제거 (침식 후 팽창)
+    mask = cv2.erode(mask, None, iterations=2)
+    mask = cv2.dilate(mask, None, iterations=2)
+
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     if not contours:
-        return False, None, None, 0
+        return False, 0, 0, 0, 0, 0
 
     largest = max(contours, key=cv2.contourArea)
     area = cv2.contourArea(largest)
 
     if area < MIN_AREA:
-        return False, None, None, 0
+        return False, 0, 0, 0, 0, 0
 
-    m = cv2.moments(largest)
-    cx = int(m["m10"] / m["m00"])
-    cy = int(m["m01"] / m["m00"])
-
-    return True, cx, cy, area
-
-
-def estimate_distance(area):
-    """
-    화면상 물체 면적(area)을 거리(cm)로 근사 변환.
-    TODO: 실측 캘리브레이션 필요 (10cm/20cm/30cm에서의 area 값을 찍어보고 공식 재조정)
-    """
-    if area <= 0:
-        return None
-    return 5000 / (area ** 0.5)  # 임시 공식 - 튜닝 필요
+    x, y, w, h = cv2.boundingRect(largest)  # 물체 전체를 감싸는 사각형
+    return True, x, y, w, h, area
 
 
 # ============================================================
-# 2. MOVEMENT - 차량 전진/정지
+# 2. MOVEMENT - 부드러운 연속 가속/감속 방식
+#
+# 이전에 "속도값을 낮춰도 안 바뀐다"고 느끼신 건, 알고보니 이전 실행에서
+# 안 죽은 좀비 프로세스가 원인이었습니다(해결됨). 그래서 다시 연속 방식으로
+# 돌아오되, 매 루프마다 속도를 아주 조금씩만 올려서 부드럽게 가속하도록
+# 만들었습니다. (펄스처럼 끊기지 않음)
 # ============================================================
 
 px = Picarx()
 
-MOVE_SPEED = 8       # 0~100, 목표 속도 (15도 빠르다고 하셔서 더 낮춤. 그래도 빠르면 5~6까지도 가능)
-RAMP_STEP = 2         # 슬로우 스타트 시 한 번에 올릴 속도 단위
-RAMP_INTERVAL = 0.15  # 슬로우 스타트 단계 사이 대기 시간(초)
+MOVE_SPEED = 10        # 목표(최고) 속도, 0~100. 그래도 빠르면 더 낮추세요.
+RAMP_STEP = 1           # 매 루프마다 올릴 속도 단위 (작을수록 더 부드러움)
+RAMP_INTERVAL = 0.05    # 루프 주기(초) - 아래 control_loop에서 이 간격으로 호출됨
 
-# 연속 속도(MOVE_SPEED)를 최대한 낮춰도 여전히 빠르다면, 모터 자체의 최소 구동
-# 임계값(데드존) 때문일 수 있습니다. 이 경우 아래 펄스 구동 방식으로 바꿔보세요:
-# 짧게 움직였다가 짧게 멈추기를 반복해서 평균 속도를 더 낮추는 방식입니다.
-USE_PULSE_DRIVE = False   # True로 바꾸면 펄스 구동 방식 사용
-PULSE_ON_TIME = 0.15      # 한 번에 움직이는 시간(초)
-PULSE_OFF_TIME = 0.25     # 그 사이 멈추는 시간(초)
-PULSE_SPEED = 15          # 펄스로 움직일 때의 순간 속도 (짧게만 움직이므로 조금 더 높아도 됨)
+BACKWARD_SPEED = 15     # 집은 후 후진할 때 속도
+BACKWARD_DURATION = 1.5  # 후진 지속 시간(초)
 
 _current_speed = 0
-_is_moving = False
 
 
-def move_forward(target_speed=MOVE_SPEED):
-    """
-    정지 상태에서 출발할 때는 0부터 target_speed까지 서서히 가속(슬로우 스타트).
-    이미 움직이는 중이면 바로 목표 속도로 유지.
-    USE_PULSE_DRIVE가 True면 대신 짧게 움직였다 멈췄다를 반복(펄스 구동).
-    """
-    global _current_speed, _is_moving
-
+def move_forward_smooth(target_speed=MOVE_SPEED):
+    """호출될 때마다 RAMP_STEP만큼만 속도를 올려서 부드럽게 가속. 매 루프 반복 호출 전제."""
+    global _current_speed
     px.set_dir_servo_angle(0)
-
-    if USE_PULSE_DRIVE:
-        px.forward(PULSE_SPEED)
-        time.sleep(PULSE_ON_TIME)
-        px.stop()
-        time.sleep(PULSE_OFF_TIME)
-        return
-
-    if not _is_moving:
-        _current_speed = 0
-        while _current_speed < target_speed:
-            _current_speed = min(_current_speed + RAMP_STEP, target_speed)
-            px.forward(_current_speed)
-            time.sleep(RAMP_INTERVAL)
-        _is_moving = True
-    else:
-        px.forward(target_speed)
+    if _current_speed < target_speed:
+        _current_speed = min(_current_speed + RAMP_STEP, target_speed)
+    px.forward(_current_speed)
 
 
 def stop_car():
-    global _current_speed, _is_moving
+    global _current_speed
     px.stop()
-    _current_speed = 0
-    _is_moving = False  # 다음에 다시 출발할 때 슬로우 스타트 재적용
+    _current_speed = 0  # 다음에 다시 출발할 때 처음부터 서서히 가속
+
+
+def move_backward_after_pick():
+    """물건을 집은 후 차량을 실제로 후진시킴 (기존엔 팔만 원위치로 갔음)"""
+    print(f"[후진] 집은 물건을 유지한 채 {BACKWARD_DURATION}초간 후진합니다...")
+    px.set_dir_servo_angle(0)
+    px.backward(BACKWARD_SPEED)
+    time.sleep(BACKWARD_DURATION)
+    px.stop()
+    print("[후진] 완료.")
 
 
 # ============================================================
@@ -179,8 +153,8 @@ gripper = Servo("P7")
 ANGLE_READY = {"base": 0, "shoulder": 30, "elbow": 30}
 ANGLE_RETREAT = {"base": 0, "shoulder": -20, "elbow": -20}
 
-GRIPPER_OPEN = 0
-GRIPPER_CLOSE = 60
+GRIPPER_OPEN = 30   # 캘리브레이션 결과: 닫히는 이동폭이 좁으면(예: 10->0) 악력이 약해서 넓게 열어둠
+GRIPPER_CLOSE = 0   # 캘리브레이션 결과: 0도가 실제로 꽉 잡는 각도
 
 
 def set_arm_angles(base_angle=0, shoulder_angle=0, elbow_angle=0, gripper_angle=0):
@@ -191,7 +165,7 @@ def set_arm_angles(base_angle=0, shoulder_angle=0, elbow_angle=0, gripper_angle=
 
 
 def align_arm_to_distance(distance):
-    print(f"[1단계] 거리 {distance:.1f}cm에 맞춰 팔 위치 조정 중...")
+    print(f"[1단계] 거리 {distance}cm(고정값)에 맞춰 팔 위치 조정 중...")
     set_arm_angles(
         base_angle=ANGLE_READY["base"],
         shoulder_angle=ANGLE_READY["shoulder"],
@@ -204,7 +178,7 @@ def align_arm_to_distance(distance):
 def grab_by_gripper():
     print("[2단계] 그리퍼로 물체 집는 중...")
     gripper.angle(GRIPPER_CLOSE)
-    time.sleep(1)
+    time.sleep(1.5)  # 서보가 완전히 닫힐 때까지 충분히 대기 (기존 1초 -> 1.5초)
 
 
 def retreat_after_grab():
@@ -218,83 +192,91 @@ def retreat_after_grab():
     time.sleep(1)
 
 
-def pick_sequence(distance):
+def pick_sequence(distance=4):
     align_arm_to_distance(distance)
     grab_by_gripper()
     retreat_after_grab()
 
 
 # ============================================================
-# 4. 실시간 스트리밍 + 로봇 제어 루프
+# 4. 카메라 캡처 + 인식 스레드 (움직임과 분리 -> 감지 반응 속도 향상)
 # ============================================================
 
-STOP_DISTANCE_CM = 10  # 이 거리 이하로 가까워지면 정지
+def capture_and_detect_loop():
+    print("[카메라] 초기화 시작...")
+    try:
+        picam2 = Picamera2()
+        config = picam2.create_video_configuration(main={"format": "RGB888", "size": (640, 480)})
+        picam2.configure(config)
+        picam2.start()
+        time.sleep(1)  # 워밍업 대기
+        print("[카메라] 초기화 완료. 인식 시작.")
+    except Exception:
+        print("[카메라] 초기화 실패! 아래 에러 내용을 확인하세요:")
+        traceback.print_exc()
+        return
 
-latest_frame = None       # 스트리밍용 최신 프레임 (감지 표시 포함)
-frame_lock = threading.Lock()
-picked = False
-
-
-def camera_and_control_loop():
-    """
-    카메라 프레임을 계속 받아오면서:
-    - 화면에 감지 표시를 그려서 latest_frame에 저장 (스트리밍용)
-    - 동시에 로봇 제어(전진/정지/집기) 로직 실행
-    """
-    global latest_frame, picked
-
-    picam2 = Picamera2()
-    config = picam2.create_video_configuration(main={"format": "RGB888", "size": (640, 480)})
-    picam2.configure(config)
-    picam2.start()
-    time.sleep(1)  # 카메라 워밍업 대기
-
-    last_log_time = 0
+    last_log = 0
 
     while True:
-        # Picamera2의 "RGB888" 포맷은 이름과 달리 실제로는 이미 [B, G, R] 순서로 나옴
-        # (OpenCV가 원하는 BGR과 동일) -> 별도 변환 불필요. cv2.cvtColor로 다시 변환하면
-        # R/B 채널이 뒤바뀌어 색상 인식이 완전히 틀어지므로 절대 변환하지 말 것.
-        frame = picam2.capture_array()
+        try:
+            frame = picam2.capture_array()  # 이미 BGR 순서 (추가 변환 금지)
 
-        detected, cx, cy, area = detect_blue_object(frame)
-        distance = None
+            detected, x, y, w, h, area = detect_blue_object(frame)
 
-        # 0.5초마다 감지 상태 로그 출력 (디버깅용 - 실제로 파란색이 잡히는지 확인)
-        now = time.time()
-        if now - last_log_time > 0.5:
+            display = frame.copy()
             if detected:
-                print(f"[감지됨] area={area:.0f}, 추정거리={estimate_distance(area):.1f}cm")
-            else:
-                print("[감지 안 됨]")
-            last_log_time = now
+                cv2.rectangle(display, (x, y), (x + w, y + h), (255, 0, 0), 2)
+                cv2.putText(display, f"BLUE area={int(area)}", (x, max(y - 10, 0)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
 
-        if detected:
-            distance = estimate_distance(area)
-            cv2.circle(frame, (cx, cy), 8, (255, 0, 0), -1)
-            cv2.putText(frame, f"dist~{distance:.1f}cm", (cx + 10, cy),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+            with state_lock:
+                shared["frame"] = display
+                shared["detected"] = detected
+                shared["area"] = area
 
-        with frame_lock:
-            latest_frame = frame.copy()
+            now = time.time()
+            if now - last_log > 0.5:
+                print(f"[감지됨] area={area:.0f}" if detected else "[감지 안 됨]")
+                last_log = now
 
-        if not picked:
-            if detected and distance is not None and distance <= STOP_DISTANCE_CM:
-                print(f"충분히 가까움(추정 거리 {distance:.1f}cm) -> 정지 후 팔 동작 시작")
-                stop_car()
-                pick_sequence(distance)
-                picked = True
-                print("집기 완료!")
-            else:
-                move_forward()
-        else:
-            stop_car()
+        except Exception:
+            print("[카메라] 프레임 처리 중 오류 발생:")
+            traceback.print_exc()
 
         time.sleep(0.03)
 
 
 # ============================================================
-# 5. FLASK - 실시간 스트리밍 서버
+# 5. 로봇 제어 스레드 (전진/정지/집기 판단)
+# ============================================================
+
+def control_loop():
+    while True:
+        with state_lock:
+            detected = shared["detected"]
+            picked = shared["picked"]
+
+        if picked:
+            stop_car()
+            time.sleep(0.1)
+            continue
+
+        if detected:
+            print("파란 물체 감지! -> 거리 4cm로 간주하고 정지 + 집기 시작")
+            stop_car()
+            pick_sequence(distance=4)
+            move_backward_after_pick()  # 집은 후 실제로 차량 후진
+            with state_lock:
+                shared["picked"] = True
+            print("집기 + 후진 완료! 이제 대기 상태로 전환합니다.")
+        else:
+            move_forward_smooth()
+            time.sleep(RAMP_INTERVAL)  # 부드러운 가속을 위한 주기 유지
+
+
+# ============================================================
+# 6. FLASK - 실시간 스트리밍 서버
 # ============================================================
 
 app = Flask(__name__)
@@ -302,15 +284,16 @@ app = Flask(__name__)
 
 def generate_mjpeg():
     while True:
-        with frame_lock:
-            if latest_frame is None:
-                continue
-            ok, buffer = cv2.imencode(".jpg", latest_frame)
+        with state_lock:
+            frame = shared["frame"]
+        if frame is None:
+            time.sleep(0.05)
+            continue
+        ok, buffer = cv2.imencode(".jpg", frame)
         if not ok:
             continue
-        frame_bytes = buffer.tobytes()
         yield (b"--frame\r\n"
-               b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n")
+               b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n")
 
 
 @app.route("/video_feed")
@@ -320,42 +303,52 @@ def video_feed():
 
 @app.route("/")
 def index():
-    return "<html><body><h3>Robot Camera</h3><img src='/video_feed'></body></html>"
+    return "<html><body><h3>Robot Camera - 192.168.0.82:8000</h3><img src='/video_feed'></body></html>"
 
 
 @app.route("/status")
 def status():
-    # 일부 카메라 뷰어 앱이 접속 전 상태 확인용으로 이 경로를 두드리는 경우가 있어 추가
-    return {"status": "ok", "picked": picked}
+    with state_lock:
+        return {"status": "ok", "detected": shared["detected"], "picked": shared["picked"]}
 
 
 # ============================================================
-# 6. 종료 처리 - 터미널에서 'q' + Enter 입력 시 안전 종료
+# 7. 종료 처리 - Ctrl+C / kill / 'q' 입력 어떤 경우든 반드시 모터 정지
 # ============================================================
+
+def shutdown(*_args):
+    print("\n종료 신호 수신 -> 모터 정지 후 프로그램을 종료합니다.")
+    try:
+        stop_car()
+    except Exception:
+        pass
+    os._exit(0)  # 스레드가 여러 개라 sys.exit()로는 안 죽을 수 있어 강제 종료 사용
+
+
+signal.signal(signal.SIGINT, shutdown)   # Ctrl+C
+signal.signal(signal.SIGTERM, shutdown)  # kill 명령
+
 
 def keyboard_listener():
-    """
-    터미널에서 'q'를 입력하고 Enter를 누르면 차량을 정지시키고 프로세스를 종료.
-    (Ctrl+C가 스레드/Flask 서버 조합에서 바로 안 먹히는 문제를 대체하기 위함)
-    """
-    print("종료하려면 'q'를 입력하고 Enter를 누르세요.")
+    print("종료하려면 'q' + Enter 를 입력하세요. (Ctrl+C도 동일하게 동작)")
     while True:
         try:
             cmd = input()
         except EOFError:
             break
         if cmd.strip().lower() == "q":
-            print("종료 신호 감지 -> 차량 정지 후 프로그램을 종료합니다.")
-            stop_car()
-            os._exit(0)
+            shutdown()
 
 
 if __name__ == "__main__":
-    cam_thread = threading.Thread(target=camera_and_control_loop, daemon=True)
+    cam_thread = threading.Thread(target=capture_and_detect_loop, daemon=True)
     cam_thread.start()
+
+    ctrl_thread = threading.Thread(target=control_loop, daemon=True)
+    ctrl_thread.start()
 
     key_thread = threading.Thread(target=keyboard_listener, daemon=True)
     key_thread.start()
 
-    print("브라우저에서 http://<라즈베리파이_IP>:8000 접속하면 실시간 영상 확인 가능")
+    print("브라우저에서 http://192.168.0.82:8000 접속하면 실시간 영상 확인 가능")
     app.run(host="0.0.0.0", port=8000, threaded=True)
