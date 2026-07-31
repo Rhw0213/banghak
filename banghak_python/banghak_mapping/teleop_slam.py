@@ -2,9 +2,15 @@
 # -*- coding: utf-8 -*-
 """
 teleop_slam.py
-26.7.27
+26.7.27 (+ 디버그 로깅 추가본)
 ================
 4단계: 조종(teleop) + 라이다 실시간 SLAM(지도 그리기)을 동시에 돌려보는 단계.
+
+[이 버전에서 추가된 것]
+    - logs/slam_debug.log 에 slam_worker 스레드의 각 단계가 기록됩니다.
+      "라이다 인식이 안 된다"는 문제를 정확히 어느 단계에서 멈추는지
+      확인하기 위한 용도입니다. 원인 파악 끝나면 이 로깅 부분은
+      지우거나 꺼두셔도 됩니다.
 
 목적:
     - 사람이 키보드로 차를 몰면서 (2단계에서 만든 teleop 로직 그대로 재사용)
@@ -29,6 +35,7 @@ teleop_slam.py
     logs/slam_map_YYYYmmdd_HHMMSS.png    (종료할 때 한 번 더, 타임스탬프 붙여서 최종본 보관)
     logs/slam_map_YYYYmmdd_HHMMSS.npy    (위 png와 같은 지도를, 6단계 A*에서 바로 쓸 숫자 배열로 저장)
     logs/odom_debug.log                  (임시 디버그: 스캔마다 오도메트리 계산값과 추정 위치를 기록)
+    logs/slam_debug.log                  (신규: slam_worker 진행 단계 로그 - 문제 진단용)
 
     * png와 npy 둘 다, 오래된 것은 자동으로 정리되어 최근 것만 남습니다
       (MAP_KEEP_LAST 값 참고 - 기본 5개).
@@ -48,9 +55,11 @@ teleop_slam.py
 """
 
 import curses
+import logging
 import os
 import threading
 import time
+import traceback
 from datetime import datetime
 
 import numpy as np
@@ -68,6 +77,21 @@ except ImportError:
     # Pillow가 없어도 프로그램 전체가 죽지 않도록, Image를 None으로 두고
     # 아래 코드에서 "Image is not None"으로 체크해서 png 저장 부분만 건너뛰게 만들어둠.
     Image = None
+
+
+# ============================================================
+# 디버그 로깅 설정 (신규 추가)
+# ============================================================
+# slam_worker 스레드가 정확히 어느 단계까지 진행되고 멈추는지 확인하기 위한
+# 로그입니다. 문제가 재현되면 logs/slam_debug.log 파일을 열어서 마지막으로
+# 찍힌 줄이 뭔지 확인하면 어디서 걸리는지 알 수 있습니다.
+os.makedirs("logs", exist_ok=True)
+logging.basicConfig(
+    filename=os.path.join("logs", "slam_debug.log"),
+    level=logging.DEBUG,
+    format="%(asctime)s [%(threadName)s] %(message)s",
+    filemode="w",  # 매 실행마다 새로 시작 (이전 실행 로그와 섞이지 않도록)
+)
 
 
 # ============================================================
@@ -110,8 +134,19 @@ LIDAR_OFFSET = 90
 # ============================================================
 # 설정값 - SLAM (BreezySLAM)
 # ============================================================
+# ---- 큰 방(약 10m x 25m) 매핑용 설정 ----
+# 나중에 큰 맵 다시 할 때 아래 두 줄 주석 풀고, 지금 쓰는 작은 트랙용 두 줄은 주석 처리
+# MAP_SIZE_PIXELS = 1250
+# MAP_SIZE_METERS = 50.0
+
+# ---- 지금 당장 쓰는 작은 트랙 테스트용 설정 ----
 MAP_SIZE_PIXELS = 1250
-MAP_SIZE_METERS = 50.0
+MAP_SIZE_METERS = 6.0
+
+# 벽 하나 감지될 때마다 그 주변을 반경 HOLE_WIDTH_MM/2 만큼 "장애물 확정"으로
+# 두껍게 칠하는 값. run_tour_auto.py 등 다른 스크립트에서도 SLAM을 새로 돌릴 때
+# 이 값을 그대로 재사용하도록 이름 붙은 상수로 뺐습니다 (여기서만 바꾸면 됨).
+HOLE_WIDTH_MM = 150
 
 MAP_SAVE_EVERY_SEC = 5.0
 LOAD_CHECK_EVERY_SEC = 2.0
@@ -323,13 +358,18 @@ def slam_worker():
     백그라운드 스레드. 라이다에 연결해서 스캔이 들어올 때마다 SLAM을 갱신하고,
     주기적으로 지도 저장 + 시스템 부하 측정을 합니다.
     """
+    logging.debug("slam_worker 스레드 시작")
+
     laser = LaserModel()
+    logging.debug("LaserModel() 생성 완료")
+
     slam = RMHC_SLAM(
         laser, MAP_SIZE_PIXELS, MAP_SIZE_METERS,
-        hole_width_mm=1000,
+        hole_width_mm=HOLE_WIDTH_MM,
         sigma_xy_mm=100,          # 기본값 100mm -> 200mm로 조금 넓힘
         sigma_theta_degrees=20,   # 기본값 20도 -> 30도로 조금 넓힘
     )
+    logging.debug("RMHC_SLAM 객체 생성 완료")
 
     mapbytes = bytearray(MAP_SIZE_PIXELS * MAP_SIZE_PIXELS)
 
@@ -338,6 +378,7 @@ def slam_worker():
     # 이전 실행에서 남은 오래된 지도 파일 정리 (png/npy 둘 다, 최근 MAP_KEEP_LAST개만 남김)
     cleanup_old_logs("logs", "slam_map_2*.png", keep_last=MAP_KEEP_LAST)
     cleanup_old_logs("logs", "slam_map_2*.npy", keep_last=MAP_KEEP_LAST)
+    logging.debug("오래된 지도 파일 정리 완료")
 
     # ---- 디버그 로그 파일 준비 (오도메트리 검증용) ----
     # 매번 실행할 때마다 이전 로그는 지우고 새로 시작합니다 (누적 안 함).
@@ -349,11 +390,54 @@ def slam_worker():
                     f"(FWD={SPEED_MM_PER_SEC_AT_MAX_FORWARD}, BACK={SPEED_MM_PER_SEC_AT_MAX_BACKWARD}, "
                     f"sigma_xy_mm={slam.sigma_xy_mm}, sigma_theta_degrees={slam.sigma_theta_degrees}) =====\n")
 
+    logging.debug(f"RPLidar 연결 시도 직전 (포트={LIDAR_PORT})")
     try:
         lidar = RPLidar(LIDAR_PORT)
+        logging.debug("RPLidar 객체 생성 성공 (포트는 열렸음)")
     except Exception as e:
         slam_status["last_error"] = f"라이다 연결 실패: {e}"
+        logging.debug(f"RPLidar 객체 생성 실패: {e}")
+        logging.debug(traceback.format_exc())
         return
+
+    # ---- 안정화 대기 + 버퍼 비우기 + 리셋 (신규 추가) ----
+    # "Descriptor length mismatch" (응답이 계속 빈 값으로 오는 문제)는
+    # 라이다 내부 MCU가 이전 실행(비정상 종료 등)의 영향으로 이상한 상태에
+    # 갇혀있을 때 흔히 발생합니다. lidar.reset()으로 내부 상태를 강제
+    # 초기화(전원 껐다 켠 것과 비슷한 효과)시키고, 재부팅될 시간을 준 뒤
+    # 다시 시도합니다.
+    try:
+        lidar.reset()
+        logging.debug("lidar.reset() 호출 완료 (내부 MCU 재부팅 시도)")
+    except Exception as e:
+        logging.debug(f"lidar.reset() 실패(무시하고 계속 진행): {e}")
+
+    time.sleep(2.0)  # 리셋 후 라이다가 재부팅되는 시간 확보
+
+    try:
+        lidar._serial.reset_input_buffer()
+        logging.debug("시리얼 입력 버퍼 초기화 완료")
+    except Exception as e:
+        logging.debug(f"시리얼 버퍼 초기화 실패(무시하고 계속 진행): {e}")
+
+    # ---- 라이다 상태 정보 확인 (health / info) ----
+    # 참고용 정보 조회입니다. 여기서 실패해도(Descriptor length mismatch 등)
+    # 실제 스캔(iter_scans)은 별개로 정상 동작할 수 있으므로, 실패하더라도
+    # 프로그램을 중단하지 않고 계속 진행합니다. 실패 시 한 번 더 재시도합니다.
+    def _try_with_retry(func, name, retries=2, delay=0.5):
+        for attempt in range(1, retries + 1):
+            try:
+                result = func()
+                logging.debug(f"{name} 성공 (시도 {attempt}회차): {result}")
+                return result
+            except Exception as e:
+                logging.debug(f"{name} 실패 (시도 {attempt}회차): {e}")
+                if attempt < retries:
+                    time.sleep(delay)
+        return None
+
+    _try_with_retry(lidar.get_info, "lidar.get_info()")
+    _try_with_retry(lidar.get_health, "lidar.get_health()")
 
     slam_status["connected"] = True
     scan_id = 0
@@ -365,9 +449,14 @@ def slam_worker():
     # 디버그용: 오도메트리가 계산한 dxy_mm을 누적해서 "이론상 이동거리 합계"를 같이 봄
     cumulative_dxy_mm = 0.0
 
+    logging.debug("lidar.iter_scans() 루프 진입 시도")
     try:
         for scan in lidar.iter_scans(min_len=60):
+            if scan_id == 0:
+                logging.debug(f"첫 스캔 수신 성공! (포인트 수: {len(scan)})")
+
             if stop_event.is_set():
+                logging.debug("stop_event 감지되어 루프 종료")
                 break
 
             distances_mm = scan_to_distance_array(scan, laser.scan_size)
@@ -390,6 +479,9 @@ def slam_worker():
 
             scan_id += 1
             slam_status["scan_count"] = scan_id
+
+            if scan_id % 50 == 0:
+                logging.debug(f"스캔 {scan_id}개 처리됨 (정상 동작 중)")
 
             # ---- 디버그 로그 기록 ----
             # 스캔마다: 그 순간 속도값/조향값, 계산된 dt/dxy/dtheta, 그리고 SLAM이
@@ -427,13 +519,24 @@ def slam_worker():
 
     except RPLidarException as e:
         slam_status["last_error"] = f"라이다 통신 오류: {e}"
+        logging.debug(f"RPLidarException 발생: {e}")
+        logging.debug(traceback.format_exc())
+    except Exception as e:
+        # 기존 코드에는 없던 부분: RPLidarException이 아닌 다른 종류의 예외까지
+        # 전부 잡아서 last_error와 로그에 남깁니다. 이걸 안 하면 스레드가
+        # 조용히 죽어버려서 화면에 아무 표시도 안 남는 문제가 생길 수 있습니다.
+        slam_status["last_error"] = f"예상 못한 오류: {e}"
+        logging.debug(f"예상 못한 예외 발생: {e}")
+        logging.debug(traceback.format_exc())
     finally:
+        logging.debug("정리(finally) 블록 진입: lidar.stop/stop_motor/disconnect 시도")
         try:
             lidar.stop()
             lidar.stop_motor()
             lidar.disconnect()
-        except Exception:
-            pass
+            logging.debug("lidar 정지/연결해제 완료")
+        except Exception as e:
+            logging.debug(f"lidar 정지/연결해제 중 오류(무시함): {e}")
         slam_status["connected"] = False
 
         # 종료 직전, 마지막 지도를 한 번 더 저장 (타임스탬프 붙여서 최종본으로 따로 보관)
@@ -460,8 +563,10 @@ def slam_worker():
                 # (이전 버전에서는 이 줄 바로 다음에 map_saved_path를 final_path로
                 #  다시 덮어써버려서 npy 경로 정보가 사라지는 버그가 있었음 - 수정함)
                 slam_status["map_saved_path"] = f"{final_path} / {npy_path}"
-            except Exception:
-                pass
+            except Exception as e:
+                logging.debug(f"최종 지도 저장 중 오류(무시함): {e}")
+
+        logging.debug("slam_worker 스레드 종료")
 
 
 # ============================================================

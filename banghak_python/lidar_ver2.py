@@ -10,9 +10,15 @@
 # 브라우저에서 http://<라즈베리파이IP>:8000 접속
 #
 # 변경점 표시:
-#   [비전 추가]      - 카메라 인식 / 미션 FSM
+#   [비전 추가]      - 카메라 인식 / 미션 FSM (단순화 버전)
 #   [스트리밍 추가]  - MJPEG 웹 스트리밍 + 실시간 HSV 튜닝 UI
+#   [단순화]         - 팬 서보 스윕/추적/FINAL/COOLDOWN 전부 제거.
+#                      카메라는 짐벌 정면(0도)에 고정한 채 절대 움직이지 않고,
+#                      조향은 오직 화면 오프셋(offset)만으로 결정한다.
+#   [재연결]         - RPLidarException 발생 시 자동 재연결 + 반복 재발 시 안전 종료
+#   [과부하 감시]    - os.getloadavg() 기반 시스템 부하 모니터 추가 (신규)
 
+import os
 import time
 import threading
 import json
@@ -25,7 +31,7 @@ import numpy as np
 
 from picamera2 import Picamera2
 
-from rplidar import RPLidar
+from rplidar import RPLidar, RPLidarException
 from robot_hat import Motor, Servo, Pin, PWM, reset_mcu, Ultrasonic
 
 from avoidance_go_back import Get_Stop_Distance, WallBackup, Get_Drive_Duty
@@ -36,7 +42,7 @@ from battery_driving_check import BatteryMonitor
 # ===== 설정 =====
 LIDAR_PORT = '/dev/ttyUSB0'
 
-# 조향
+# 조향 (라이다 회피용)
 STEER_GAIN = 0.3
 STEER_DEADZONE = 0
 STEER_ACTIVATE_DIST = 800
@@ -49,17 +55,26 @@ STOP_DIST_MM = 300
 
 # 후방 거리 기반 동적 후진거리
 REAR_SECTOR_DEG = 25
-REAR_SAFETY_MARGIN_CM = 15
+REAR_SAFETY_MARGIN_CM = 11
 DEFAULT_BACK_TARGET_CM = 60
 
 # 속도
-VELOCITY = 60
+# VELOCITY = 60
+VELOCITY = 0
 SPEED_FAST = 0
 SPEED_BACK = 0
-SPEED_SLOW = VELOCITY / 2
+SPEED_SLOW = 30
 
 SPEED_STEP = 3
 SCAN_MIN_LEN = 60
+
+# 초근접 탈출 (좁은 공간에서 조향 꺾인 채 후진하며 갇히는 것 방지)
+VERY_CLOSE_CM = 5          # 이 거리 이내는 "낀 상황"으로 간주
+STEER_RESET_TOL = 3.0      # 이 각도 이상 꺾여 있으면 0으로 리셋 대상
+
+# ===== [과부하 감시 추가] 시스템 부하(CPU) 설정 =====
+LOAD_CHECK_INTERVAL_SEC = 2.0     # 이 간격마다 부하를 읽고 표시
+LOAD_WARN_RATIO = 1.0             # 1분 평균 부하가 (코어 수 * 이 값)을 넘으면 경고
 
 
 # =========================================================================
@@ -73,9 +88,14 @@ CAM_TILT_ANGLE = -15
 CAM_SWAP_RB = False         # 스트림에서 노란 물체가 파랗게 보이면 웹 UI로 토글
 
 # 노란색 HSV 범위 (OpenCV H는 0~179). 웹 UI 슬라이더로 실시간 변경 가능.
-YELLOW_H_MIN, YELLOW_H_MAX = 20, 35
-YELLOW_S_MIN, YELLOW_S_MAX = 100, 255
-YELLOW_V_MIN, YELLOW_V_MAX = 100, 255
+# COLOR_H_MIN, COLOR_H_MAX = 20, 35
+# COLOR_S_MIN, COLOR_S_MAX = 100, 255
+# COLOR_V_MIN, COLOR_V_MAX = 100, 255
+
+# 파란색 코드
+COLOR_H_MIN, COLOR_H_MAX = 95, 130
+COLOR_S_MIN, COLOR_S_MAX = 100, 255
+COLOR_V_MIN, COLOR_V_MAX = 60, 255
 
 MIN_TARGET_AREA = 400
 
@@ -83,45 +103,22 @@ MIN_TARGET_AREA = 400
 TARGET_REAL_WIDTH_CM = 6.5  # ★ 본인 오브젝트 실제 가로폭으로 수정
 CAM_FOCAL_PX = 330.0        # ★ 반드시 캘리브레이션 필요 (해상도 바꾸면 재측정)
 
-ARRIVE_DISTANCE_CM = 10
-
-ARRIVE_HOLD_SEC = 10.0
-REARM_COOLDOWN_SEC = 8.0
-REARM_MIN_DISTANCE_CM = 40
-
-# ===== 카메라 서보 팬 추적 ==== 추가
-PAN_LIMIT = 40.0             # ★ 실제 서보 물리 한계로 조정 필요
-CAM_FOV_H_DEG = 25.0         # ★ range_check.py 실측값으로 교체
-PAN_TRACK_GAIN = 0.6
-PAN_STEP_MAX_DEG = 8.0       # 프레임당 최대 이동각 (모션블러 방지)
-PAN_CENTER_TOL_DEG = 5.0
-STEER_BEARING_GAIN = 0.9
-
-SWEEP_POSITIONS = [-40, -20, 0, 20, 40, 20, 0, -20]
-SWEEP_HOLD_SEC = 0.5
-
-FINAL_ENTRY_CM = 25
-FINAL_EXIT_CM = 35 
-# ============================ 추가
+ARRIVE_DISTANCE_CM = 10     # 이 거리 + 화면 중앙 정렬되면 도착 처리
+ARRIVE_CENTER_TOL = 0.15    # 도착 판정용 중앙 정렬 허용 오프셋
 
 APPROACH_SPEED = 20
-TARGET_STEER_GAIN = 30.0
+TARGET_STEER_GAIN = 30.0    # 화면 오프셋(-1~+1) -> 조향각 변환 계수 (핵심)
 LOST_TIMEOUT = 2.0
 DETOUR_TIME = 1.2
 DETOUR_STEER = 25.0
 CONFIRM_HITS = 3
 TARGET_TOLERANCE_RATIO = 0.35   # 목표물/장애물 판정 오차 허용 계수
 
-# 미션 상태
+# 미션 상태 (단순화: SEARCH -> APPROACH -> DETOUR -> ARRIVED 4개뿐)
 SEARCH = "SEARCH"
 APPROACH = "APPROACH"
 DETOUR = "DETOUR"
 ARRIVED = "ARRIVED"
-# ==========추가
-ARRIVED = "ARRIVED"
-COOLDOWN = "COOLDOWN"        # 기존에 없었으면 추가
-FINAL = "FINAL"              # 신규
-# ==========추가
 
 
 class TargetInfo:
@@ -153,8 +150,8 @@ VISION_ERROR = ""           # 실패 사유 (웹 화면에 표시)
 
 
 def get_hsv_range():
-    lower = np.array([YELLOW_H_MIN, YELLOW_S_MIN, YELLOW_V_MIN])
-    upper = np.array([YELLOW_H_MAX, YELLOW_S_MAX, YELLOW_V_MAX])
+    lower = np.array([COLOR_H_MIN, COLOR_S_MIN, COLOR_V_MIN])
+    upper = np.array([COLOR_H_MAX, COLOR_S_MAX, COLOR_V_MAX])
     return lower, upper
 
 
@@ -162,12 +159,6 @@ def grab_frame():
     """
     picamera2에서 프레임을 받아 OpenCV용 BGR 3채널로 정규화해서 반환.
     실패하면 None.
-
-    주의) picamera2의 포맷 이름은 직관과 반대다.
-      - "RGB888" 로 설정하면 실제 numpy 배열은 BGR 순서 (OpenCV와 동일)
-      - "XBGR8888" 등은 4채널로 나옴
-    환경/버전에 따라 달라질 수 있어서 채널 수를 보고 분기하고,
-    그래도 색이 뒤집히면 CAM_SWAP_RB 를 웹 UI에서 토글한다.
     """
     try:
         arr = _picam2.capture_array()
@@ -298,6 +289,75 @@ def get_target():
 
 
 # =========================================================================
+# ===== [과부하 감시 추가] 시스템 부하(CPU) 모니터 =====
+#   BatteryMonitor와 완전히 같은 패턴: interval마다만 실제로 읽고 출력해서
+#   메인 루프에 부담을 주지 않는다.
+#
+#   os.getloadavg()는 "CPU 사용률(%)"이 아니라 "실행 대기 중인 프로세스
+#   평균 개수(1분 이동평균)"다. 코어 수보다 이 값이 크면 CPU가 감당 못 하는
+#   작업이 쌓이고 있다는 뜻으로 해석한다 (예: 4코어 기준 4.0 초과 시 과부하 의심).
+# =========================================================================
+
+def Get_Load_Warn_Threshold():
+    """이 부하(1분 평균) 이상이면 '과부하' 경고를 표시할 기준값"""
+    cores = os.cpu_count() or 1
+    return cores * LOAD_WARN_RATIO
+
+
+class SystemLoadMonitor:
+    """
+    주행 중 CPU 부하(load average)를 주기적으로 읽어서 표시하는 부품.
+    BatteryMonitor와 동일한 사용 패턴: 메인 루프에서 show()를 반복 호출하면,
+    정해진 간격마다만 실제로 읽고 출력한다.
+    """
+
+    def __init__(self, interval=LOAD_CHECK_INTERVAL_SEC):
+        self.interval = interval
+        self.last_time = 0
+        self.last_load1 = None
+        self.max_load1 = 0.0
+        self.cores = os.cpu_count() or 1
+
+    def read(self):
+        """지금 1분 평균 부하를 읽어서 반환. 실패 시 None."""
+        try:
+            load1, load5, load15 = os.getloadavg()
+            if load1 > self.max_load1:
+                self.max_load1 = load1
+            self.last_load1 = load1
+            return load1
+        except Exception:
+            return None
+
+    def show(self):
+        """
+        interval이 지났을 때만 부하를 읽고 한 줄 출력.
+        반환값: 방금 표시했으면 load1(float), 아니면 None
+        """
+        now = time.time()
+        if now - self.last_time < self.interval:
+            return None
+
+        self.last_time = now
+        load1 = self.read()
+        if load1 is None:
+            print("[CPU부하] 읽기 실패")
+            return None
+
+        threshold = Get_Load_Warn_Threshold()
+        warn = f"  <-- 과부하 의심! (코어 {self.cores}개)" if load1 > threshold else ""
+        print(f"##[CPU부하] {load1:.2f}  (최고 {self.max_load1:.2f}, "
+              f"코어 {self.cores}개, 경고기준 {threshold:.1f}){warn}##")
+        return load1
+
+    def is_overloaded(self):
+        """지금까지 마지막으로 읽은 값 기준, 과부하 상태인지 여부."""
+        if self.last_load1 is None:
+            return False
+        return self.last_load1 > Get_Load_Warn_Threshold()
+
+
+# =========================================================================
 # ===== [스트리밍 추가] MJPEG 웹 서버 + 실시간 HSV 튜닝 UI =====
 # =========================================================================
 
@@ -320,6 +380,7 @@ _telemetry = {
     "lidar_mm": -1.0,
     "speed": 0,
     "steer": 0.0,
+    "load_1min": 0.0,          # ===== [과부하 감시 추가] =====
 }
 _telemetry_lock = threading.Lock()
 
@@ -411,7 +472,7 @@ PAGE_HTML = """<!DOCTYPE html>
 <button onclick="fetch('/set?mask=toggle')">마스크 보기 전환</button>
 <button onclick="fetch('/set?swaprb=toggle')">R/B 색상 반전</button>
 <button onclick="dump()">현재 HSV 값 출력</button>
-<h3>HSV 범위 (노란색 튜닝)</h3>
+<h3>HSV 범위 (목표물 인식 튜닝)</h3>
 <div id="sliders"></div>
 <script>
 const P=[["h_min",179],["h_max",179],["s_min",255],["s_max",255],["v_min",255],["v_max",255]];
@@ -438,6 +499,7 @@ async function poll(){
       `상태  : ${s.state}\\n사유  : ${s.reason}\\n`+
       `초음파: ${s.ultra_cm.toFixed(0)} cm   라이다: ${s.lidar_mm.toFixed(0)} mm\\n`+
       `속도  : ${s.speed}   조향: ${s.steer.toFixed(0)}도\\n`+
+      `CPU부하: ${s.load_1min.toFixed(2)}\\n`+
       `목표물: ${s.found?('발견  오프셋 '+s.offset.toFixed(2)+
         '  카메라거리 '+s.distance_cm.toFixed(0)+'cm  폭 '+s.width_px.toFixed(0)+'px')
         :'없음'}`;
@@ -458,8 +520,8 @@ class _StreamHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         global _stream_clients, STREAM_SHOW_MASK, CAM_SWAP_RB
-        global YELLOW_H_MIN, YELLOW_H_MAX, YELLOW_S_MIN
-        global YELLOW_S_MAX, YELLOW_V_MIN, YELLOW_V_MAX
+        global COLOR_H_MIN, COLOR_H_MAX, COLOR_S_MIN
+        global COLOR_S_MAX, COLOR_V_MIN, COLOR_V_MAX
 
         parsed = urlparse(self.path)
         path = parsed.path
@@ -485,9 +547,9 @@ class _StreamHandler(BaseHTTPRequestHandler):
                 "distance_cm": t.distance_cm,
                 "width_px": t.width_px,
                 "hsv": {
-                    "h_min": YELLOW_H_MIN, "h_max": YELLOW_H_MAX,
-                    "s_min": YELLOW_S_MIN, "s_max": YELLOW_S_MAX,
-                    "v_min": YELLOW_V_MIN, "v_max": YELLOW_V_MAX,
+                    "h_min": COLOR_H_MIN, "h_max": COLOR_H_MAX,
+                    "s_min": COLOR_S_MIN, "s_max": COLOR_S_MAX,
+                    "v_min": COLOR_V_MIN, "v_max": COLOR_V_MAX,
                 },
             })
             body = json.dumps(data).encode('utf-8')
@@ -506,12 +568,12 @@ class _StreamHandler(BaseHTTPRequestHandler):
                 except Exception:
                     return cur
 
-            YELLOW_H_MIN = gv('h_min', YELLOW_H_MIN)
-            YELLOW_H_MAX = gv('h_max', YELLOW_H_MAX)
-            YELLOW_S_MIN = gv('s_min', YELLOW_S_MIN)
-            YELLOW_S_MAX = gv('s_max', YELLOW_S_MAX)
-            YELLOW_V_MIN = gv('v_min', YELLOW_V_MIN)
-            YELLOW_V_MAX = gv('v_max', YELLOW_V_MAX)
+            COLOR_H_MIN = gv('h_min', COLOR_H_MIN)
+            COLOR_H_MAX = gv('h_max', COLOR_H_MAX)
+            COLOR_S_MIN = gv('s_min', COLOR_S_MIN)
+            COLOR_S_MAX = gv('s_max', COLOR_S_MAX)
+            COLOR_V_MIN = gv('v_min', COLOR_V_MIN)
+            COLOR_V_MAX = gv('v_max', COLOR_V_MAX)
 
             if 'mask' in q:
                 STREAM_SHOW_MASK = not STREAM_SHOW_MASK
@@ -521,9 +583,9 @@ class _StreamHandler(BaseHTTPRequestHandler):
             if 'dump' in q:
                 print("\n===== 현재 설정 (코드에 반영하세요) =====")
                 print(f"CAM_SWAP_RB = {CAM_SWAP_RB}")
-                print(f"YELLOW_H_MIN, YELLOW_H_MAX = {YELLOW_H_MIN}, {YELLOW_H_MAX}")
-                print(f"YELLOW_S_MIN, YELLOW_S_MAX = {YELLOW_S_MIN}, {YELLOW_S_MAX}")
-                print(f"YELLOW_V_MIN, YELLOW_V_MAX = {YELLOW_V_MIN}, {YELLOW_V_MAX}")
+                print(f"COLOR_H_MIN, COLOR_H_MAX = {COLOR_H_MIN}, {COLOR_H_MAX}")
+                print(f"COLOR_S_MIN, COLOR_S_MAX = {COLOR_S_MIN}, {COLOR_S_MAX}")
+                print(f"COLOR_V_MIN, COLOR_V_MAX = {COLOR_V_MIN}, {COLOR_V_MAX}")
                 t = get_target()
                 if t.found:
                     print(f"[참고] 지금 폭={t.width_px:.0f}px "
@@ -601,7 +663,11 @@ def stop_stream():
 
 
 # =========================================================================
-# ===== [비전 추가] 미션 FSM =====
+# ===== [비전 추가] 미션 FSM (단순화 버전) =====
+#   SEARCH -> APPROACH -> (필요시 DETOUR로 잠깐 우회) -> ARRIVED
+#   카메라 팬은 항상 정면 고정 (스윕/추적 없음). 조향은 오직 화면
+#   오프셋(offset)으로만 결정된다. "정면 정렬"은 별도 단계가 아니라,
+#   접근하는 동안 offset이 0에 가까워지는 되먹임 결과로 자연히 달성됨.
 # =========================================================================
 
 MISSION_STATE = SEARCH
@@ -610,57 +676,29 @@ _last_offset = 0.0
 _detour_start = 0.0
 _detour_dir = 1
 _hit_count = 0
-# ====== 추가
-_arrive_time = 0.0
-_cooldown_start = 0.0
-_arrive_count = 0
-_pan_angle = 0.0              # 메인 루프가 매 프레임 갱신하는 "현재 팬 각도"
-_sweep_index = 0
-_sweep_last_change = 0.0
+# 0730 - 12:30 / 추가 
+_detour_repeat_count = 0   # ★ 추가
 
+def is_the_target(target, ultra_cm):
+    """
+    전방 물체가 목표물인지 장애물인지 판정.
+    카메라 추정거리와 초음파 거리가 비슷하면 목표물, 크게 다르면 앞에 낀 장애물.
+    """
+    if not target.found or not target.is_centered(0.15):
+        return False
+    if ultra_cm <= 0 or target.distance_cm <= 0:
+        return False
+    # 0730 - 12:26 / 추가
+    # ★ 중앙 정렬 조건을 넓게 완화 (0.15 -> 0.8): 화면 안에만 있으면 판정 대상
+    if abs(target.offset) > 0.8:
+        return False
+    tolerance = max(10.0, target.distance_cm * TARGET_TOLERANCE_RATIO)
+    return abs(target.distance_cm - ultra_cm) < tolerance    
 
-def _enter_arrived():
-    global MISSION_STATE, _arrive_time, _arrive_count
-    MISSION_STATE = ARRIVED
-    _arrive_time = time.time()
-    _arrive_count += 1
-    print(f"[미션] ★ 도착 #{_arrive_count} - {ARRIVE_HOLD_SEC:.0f}초 정지")
+    # 0730 - 12:26 / 원본 
+    # tolerance = max(8.0, target.distance_cm * TARGET_TOLERANCE_RATIO)
+    # return abs(target.distance_cm - ultra_cm) < tolerance
 
-
-def _sweep_pan(now):
-    global _sweep_index, _sweep_last_change
-    if now - _sweep_last_change >= SWEEP_HOLD_SEC:
-        _sweep_index = (_sweep_index + 1) % len(SWEEP_POSITIONS)
-        _sweep_last_change = now
-    return SWEEP_POSITIONS[_sweep_index]
-
-
-def _step_toward(current, target, max_step):
-    diff = target - current
-    if abs(diff) <= max_step:
-        return target
-    return current + max_step * (1 if diff > 0 else -1)
-
-
-def _track_pan(target, current_pan):
-    """화면 오프셋으로 목표 팬각을 계산하고, 프레임당 이동량을 제한해서 반환"""
-    if not target.found:
-        return current_pan
-    pan_error = target.offset * (CAM_FOV_H_DEG / 2.0) * PAN_TRACK_GAIN
-    desired = max(-PAN_LIMIT, min(PAN_LIMIT, current_pan + pan_error))
-    return _step_toward(current_pan, desired, PAN_STEP_MAX_DEG)
-
-
-def _pan_to_center(current_pan):
-    return _step_toward(current_pan, 0.0, PAN_STEP_MAX_DEG)
-
-
-def compute_bearing(target, pan_angle):
-    """차체 기준 목표물 방위각(도) = 팬각 + 화면오프셋을 화각으로 환산한 값"""
-    if not target.found:
-        return pan_angle
-    return pan_angle + target.offset * (CAM_FOV_H_DEG / 2.0)
-# ====== 추가
 
 class Command:
     """
@@ -668,44 +706,32 @@ class Command:
     handled=True  -> speed/steer 적용. allow_backup=False면 후진 금지
     """
     def __init__(self, handled=False, speed=0, steer=0.0,
-                 allow_backup=True, state=SEARCH, reason="", pan=0.0):
+                 allow_backup=True, state=SEARCH, reason=""):
         self.handled = handled
         self.speed = speed
         self.steer = steer
         self.allow_backup = allow_backup
         self.state = state
         self.reason = reason
-        # ===== 추가
-        self.pan = pan          # ★ 신규: 이번 프레임에 명령할 팬 각도
-        # ===== 추가
 
-def is_the_target(target, ultra_cm, pan_angle):
-    """
-    전방 물체가 목표물인지 장애물인지 판정.
-    카메라 추정거리와 초음파 거리가 비슷하면 목표물, 크게 다르면 앞에 낀 장애물.
-    """
-    # ===== 추가
-    if abs(pan_angle) > PAN_CENTER_TOL_DEG:
-        return False    # 카메라가 정면이 아니면 초음파와 비교 자체가 무의미
-    # ===== 추가
-    if not target.found or not target.is_centered(0.15):
-        return False
-    if ultra_cm <= 0 or target.distance_cm <= 0:
-        return False
-    tolerance = max(8.0, target.distance_cm * TARGET_TOLERANCE_RATIO)
-    return abs(target.distance_cm - ultra_cm) < tolerance
-
+#0730 - 12:28 / 추가
+_detour_repeat_count = 0
+MAX_DETOUR_REPEAT = 3
 
 def mission_step(ultra_cm, lidar_min):
-    global MISSION_STATE, _last_seen_time, _last_offset
-    global _detour_start, _detour_dir, _hit_count, _cooldown_start, _pan_angle
+    # 7030 - 12:31 / 원본
+    # global MISSION_STATE, _last_seen_time, _last_offset
+    # global _detour_start, _detour_dir, _hit_count
 
-    now = time.time()
+    # 7030 - 12:31 / 추가
+    global MISSION_STATE, _last_seen_time, _last_offset
+    global _detour_start, _detour_dir, _hit_count, _detour_repeat_count
 
     if not VISION_ENABLED:
-        return Command(handled=False, state=SEARCH, reason="비전 비활성", pan=0.0)
+        return Command(handled=False, state=SEARCH, reason="비전 비활성")
 
     target = get_target()
+    now = time.time()
 
     if target.found and target.is_fresh():
         _last_seen_time = now
@@ -716,134 +742,118 @@ def mission_step(ultra_cm, lidar_min):
 
     # ---------- ARRIVED ----------
     if MISSION_STATE == ARRIVED:
-        remain = ARRIVE_HOLD_SEC - (now - _arrive_time)
-        if remain > 0:
-            return Command(handled=True, speed=0, steer=0.0, allow_backup=False,
-                           state=ARRIVED, reason=f"도착 정지 유지 {remain:.1f}초 남음",
-                           pan=0.0)
-        MISSION_STATE = COOLDOWN
-        _cooldown_start = now
-        _hit_count = 0
-        print("[미션] 정지 해제 -> COOLDOWN")
+        # 로봇팔이 잡는 동안 정지 유지 (재탐색 없음 - 필요시 프로그램 재실행)
+        return Command(handled=True, speed=0, steer=0.0, allow_backup=False,
+                       state=ARRIVED, reason="목표물 도착 - 정지 유지")
 
-    # ---------- COOLDOWN ----------
-    if MISSION_STATE == COOLDOWN:
-        elapsed = now - _cooldown_start
-        far_enough = (ultra_cm < 0) or (ultra_cm > REARM_MIN_DISTANCE_CM)
-        if elapsed >= REARM_COOLDOWN_SEC and far_enough:
-            MISSION_STATE = SEARCH
-            _hit_count = 0
-            print("[미션] 재탐색 시작 -> SEARCH")
-        else:
-            return Command(handled=False, state=COOLDOWN,
-                           reason=f"쿨다운 {elapsed:.1f}/{REARM_COOLDOWN_SEC:.0f}초 "
-                                  f"초음파 {ultra_cm:.0f}cm", pan=0.0)
-
-    # ---------- SEARCH: 팬 스윕, 조향은 기존 회피에 위임 ----------
+    # ---------- SEARCH ----------
+    # 카메라 스윕 없음 - 짐벌은 main()에서 최초 1회 0도로 고정된 채 유지된다.
     if MISSION_STATE == SEARCH:
-        sweep_pan = _sweep_pan(now)
         if _hit_count >= CONFIRM_HITS:
-            print(f"[미션] 노란 오브젝트 발견(거리≈{target.distance_cm:.0f}cm) -> APPROACH")
+            print(f"[미션] 목표물 발견(거리≈{target.distance_cm:.0f}cm) -> APPROACH")
             MISSION_STATE = APPROACH
         else:
-            return Command(handled=False, state=SEARCH, reason="탐색 중 (팬 스윕)",
-                           pan=sweep_pan)
+            return Command(handled=False, state=SEARCH, reason="탐색 중")
 
     # ---------- DETOUR ----------
     if MISSION_STATE == DETOUR:
-        track_pan = _track_pan(target, _pan_angle) if target.found else _pan_angle
         if now - _detour_start > DETOUR_TIME:
             print("[미션] 우회 종료 -> APPROACH 복귀")
             MISSION_STATE = APPROACH
         else:
             if 0 < ultra_cm < 8 or lidar_min < 200:
                 return Command(handled=False, state=DETOUR,
-                               reason="우회 중 초근접 - 기존 회피로 위임", pan=track_pan)
+                               reason="우회 중 초근접 - 기존 회피로 위임")
             return Command(handled=True, speed=APPROACH_SPEED,
                            steer=_detour_dir * DETOUR_STEER, allow_backup=True,
-                           state=DETOUR, reason="장애물 우회 중", pan=track_pan)
-
-    # ---------- FINAL: 팬을 0도로 되돌리며 정밀 접근 ----------
-    if MISSION_STATE == FINAL:
-        center_pan = _pan_to_center(_pan_angle)
-        pan_ready = abs(center_pan) <= PAN_CENTER_TOL_DEG
-
-        if 0 < ultra_cm <= ARRIVE_DISTANCE_CM and pan_ready:
-            _enter_arrived()
-            return Command(handled=True, speed=0, steer=0.0, allow_backup=False,
-                           state=ARRIVED, reason=f"목표물 {ultra_cm:.0f}cm 도착", pan=0.0)
-
-        if ultra_cm > FINAL_EXIT_CM or ultra_cm <= 0:
-            print("[미션] 목표물과 재이격 -> APPROACH 복귀")
-            MISSION_STATE = APPROACH
-        else:
-            bearing = compute_bearing(target, center_pan) if target.found else 0.0
-            steer = max(-STEER_LIMIT, min(STEER_LIMIT, bearing * STEER_BEARING_GAIN))
-            speed = max(10, int(APPROACH_SPEED * 0.5))
-            return Command(handled=True, speed=speed, steer=steer,
-                           allow_backup=False, state=FINAL,
-                           reason=f"정밀접근 초음파={ultra_cm:.0f}cm 팬={center_pan:.0f}도",
-                           pan=center_pan)
+                           state=DETOUR, reason="장애물 우회 중")
 
     # ---------- APPROACH ----------
-    track_pan = _track_pan(target, _pan_angle) if target.found else _pan_angle
+    # 안전핀: 초근접이면 미션 로직이 뭘 하려 했든 기존 탈출(정지+후진) 로직에 위임한다.
+    # (미션 판단으로 handled=True를 계속 반환하면 main()의 1순위 정지/탈출 블록에
+    #  아예 도달하지 못해 좁은 공간에 낄 수 있음)
+    if 0 < ultra_cm <= VERY_CLOSE_CM:
+        return Command(handled=False, state=APPROACH, reason="접근 중 초근접 - 기존 탈출로 위임")
 
     if not (target.found and target.is_fresh()):
-        if 0 < ultra_cm <= ARRIVE_DISTANCE_CM and abs(_pan_angle) <= PAN_CENTER_TOL_DEG:
+        if 0 < ultra_cm <= ARRIVE_DISTANCE_CM:
             print(f"[미션] 근접 상실 + 초음파 {ultra_cm:.0f}cm -> 도착 처리")
-            _enter_arrived()
+            MISSION_STATE = ARRIVED
             return Command(handled=True, speed=0, steer=0.0, allow_backup=False,
-                           state=ARRIVED, reason="도착", pan=0.0)
+                           state=ARRIVED, reason="도착")
         if now - _last_seen_time > LOST_TIMEOUT:
             print("[미션] 목표물 상실 -> SEARCH 복귀")
             MISSION_STATE = SEARCH
-            return Command(handled=False, state=SEARCH, reason="목표물 상실", pan=0.0)
+            return Command(handled=False, state=SEARCH, reason="목표물 상실")
+        # 잠깐 놓친 경우: 마지막 오프셋으로 관성 주행
         return Command(handled=True, speed=APPROACH_SPEED,
                        steer=_last_offset * TARGET_STEER_GAIN, allow_backup=False,
-                       state=APPROACH, reason="일시 상실 - 관성 주행", pan=track_pan)
+                       state=APPROACH, reason="일시 상실 - 관성 주행")
 
-    # 정밀접근 구간 진입
-    if 0 < ultra_cm <= FINAL_ENTRY_CM:
-        print(f"[미션] 정밀접근 구간 진입(초음파 {ultra_cm:.0f}cm) -> FINAL")
-        MISSION_STATE = FINAL
-        return Command(handled=True, speed=max(10, int(APPROACH_SPEED * 0.5)),
-                       steer=0.0, allow_backup=False, state=FINAL,
-                       reason="정밀접근 시작", pan=track_pan)
+    # 1순위: 도착 판정 (거리 + 화면 중앙 정렬)
+    if 0 < ultra_cm <= ARRIVE_DISTANCE_CM and target.is_centered(ARRIVE_CENTER_TOL):
+        print(f"[미션] 목표물 {ultra_cm:.0f}cm 도달 -> 정지")
+        MISSION_STATE = ARRIVED
+        return Command(handled=True, speed=0, steer=0.0, allow_backup=False,
+                       state=ARRIVED, reason=f"목표물 {ultra_cm:.0f}cm 도착")
 
-    # 앞을 막은 게 목표물이 아니면 우회
+    # 2순위: 앞을 막은 게 목표물이 아니면 우회
     blocked = (0 < ultra_cm < 25) or (0 < lidar_min < STOP_DIST_MM)
-    if blocked and not is_the_target(target, ultra_cm, _pan_angle):
-        _detour_dir = 1 if target.offset < 0 else -1
-        _detour_start = now
-        MISSION_STATE = DETOUR
-        print(f"[미션] 경로상 장애물 -> {_detour_dir} 방향 우회")
-        return Command(handled=True, speed=APPROACH_SPEED,
-                       steer=_detour_dir * DETOUR_STEER, allow_backup=True,
-                       state=DETOUR, reason="우회 시작", pan=track_pan)
+    if blocked and not is_the_target(target, ultra_cm):
+        _detour_repeat_count += 1
+        if _detour_repeat_count >= MAX_DETOUR_REPEAT:
+            # 같은 자리에서 우회만 반복 중 -> 오판 가능성 높음. 강제 접근 시도
+            print(f"[미션] 우회 {_detour_repeat_count}회 반복 -> 강제 접근 전환")
+            _detour_repeat_count = 0
+        else:
+            _detour_dir = 1 if target.offset < 0 else -1
+            _detour_start = now
+            MISSION_STATE = DETOUR
+            print(f"[미션] 경로상 장애물(초음파 {ultra_cm:.0f}cm / 라이다 {lidar_min:.0f}mm) "
+                  f"-> {_detour_dir} 방향 우회")
+            return Command(handled=True, speed=APPROACH_SPEED,
+                           steer=_detour_dir * DETOUR_STEER, allow_backup=True,
+                           state=DETOUR, reason="우회 시작")
+    else:
+        _detour_repeat_count = 0   # 정상 접근 중이면 카운터 리셋
 
-    # 정상 접근: 팬 추적 + 방위각 기반 조향
-    bearing = compute_bearing(target, _pan_angle)
-    steer = max(-STEER_LIMIT, min(STEER_LIMIT, bearing * STEER_BEARING_GAIN))
-    speed = APPROACH_SPEED
-    if 0 < ultra_cm < 40:
-        speed = max(12, int(APPROACH_SPEED * 0.6))
+
+    # 0730 - 12:28 / 원본
+    # blocked = (0 < ultra_cm < 25) or (0 < lidar_min < STOP_DIST_MM)
+    # if blocked and not is_the_target(target, ultra_cm):
+    #     _detour_dir = 1 if target.offset < 0 else -1
+    #     _detour_start = now
+    #     MISSION_STATE = DETOUR
+    #     print(f"[미션] 경로상 장애물(초음파 {ultra_cm:.0f}cm / 라이다 {lidar_min:.0f}mm) "
+    #           f"-> {_detour_dir} 방향 우회")
+    #     return Command(handled=True, speed=APPROACH_SPEED,
+    #                    steer=_detour_dir * DETOUR_STEER, allow_backup=True,
+    #                    state=DETOUR, reason="우회 시작")
+
+    # 3순위: 정상 접근 - 화면 오프셋만으로 조향 (정면 정렬은 이 되먹임의 결과)
+    # 0730 - 12:16 / 원본
+    # steer = max(-STEER_LIMIT, min(STEER_LIMIT, target.offset * TARGET_STEER_GAIN))
+    # speed = APPROACH_SPEED
+    # if 0 < ultra_cm < 30:
+    #     speed = max(12, int(APPROACH_SPEED * 0.6))
+
+    # # 0730 - 12:16 / 추가
+    # 3순위: 정상 접근 - 목표물 발견 시 속도 절반으로 감속 + 화면 오프셋으로 조향
+    steer = max(-STEER_LIMIT, min(STEER_LIMIT, target.offset * TARGET_STEER_GAIN))
+    speed = max(1, int(VELOCITY * 0.5))   # ★ 목표물 발견 -> 항상 절반 속도
+    if 0 < ultra_cm < 30:
+        speed = max(12, int(APPROACH_SPEED * 0.3))  # 더 가까워지면 한 번 더 감속(선택)
 
     return Command(handled=True, speed=speed, steer=steer, allow_backup=False,
                    state=APPROACH,
-                   reason=f"접근 팬={_pan_angle:.0f}도 방위각={bearing:.0f}도 "
-                          f"카메라≈{target.distance_cm:.0f}cm 초음파={ultra_cm:.0f}cm",
-                   pan=track_pan)
+                   reason=f"접근 오프셋={target.offset:+.2f} "
+                          f"카메라≈{target.distance_cm:.0f}cm 초음파={ultra_cm:.0f}cm")
+
+
 def calibrate_vision():
     """
     차량을 움직이지 않고 카메라만 튜닝하는 모드.
       python3 lidar_ultra_vision.py calib
-
-    순서:
-      1) 브라우저 접속 -> 영상이 보이는지 확인
-      2) 노란 물체가 파랗게 보이면 'R/B 색상 반전' 클릭
-      3) '마스크 보기 전환' 클릭 후 슬라이더로 오브젝트만 하얗게 만들기
-      4) 오브젝트를 30cm 앞에 두고 '현재 HSV 값 출력' 클릭
-      5) 터미널에 찍힌 값들을 이 파일 상단 상수에 반영
     """
     start_vision()
     start_stream()      # 카메라가 실패해도 안내 화면을 보여주기 위해 항상 시작
@@ -861,7 +871,7 @@ def calibrate_vision():
                       f"| 현재설정 거리≈{t.distance_cm:.0f}cm "
                       f"| 30cm 기준 CAM_FOCAL_PX 추천값={suggested:.0f}")
             else:
-                print("노란색 미검출 - 브라우저에서 S/V 하한을 낮추거나 R/B 반전 확인")
+                print("목표물 미검출 - 브라우저에서 S/V 하한을 낮추거나 R/B 반전 확인")
             time.sleep(0.5)
     except KeyboardInterrupt:
         stop_stream()
@@ -924,6 +934,40 @@ def compute_dynamic_backspeed(rear_cm, base_backspeed):
     return max(1, int(base_backspeed * ratio))
 
 
+def connect_lidar(port, max_retries=5):
+    """
+    라이다 연결 + 리셋. 시리얼 스트림이 꼬여있을 수 있으므로
+    stop/reset 후 약간의 대기시간을 두고 health를 확인한다.
+    """
+    for attempt in range(1, max_retries + 1):
+        lidar = None
+        try:
+            lidar = RPLidar(port)
+            try:
+                lidar.stop()
+                lidar.stop_motor()
+            except Exception:
+                pass
+            time.sleep(0.3)
+            try:
+                lidar.reset()   # 내부 버퍼/상태 리셋
+            except Exception:
+                pass
+            time.sleep(1.0)
+            health = lidar.get_health()
+            print(f"[라이다] 연결 성공 (시도 {attempt}/{max_retries}), 상태: {health}")
+            return lidar
+        except Exception as e:
+            print(f"[라이다] 연결 시도 {attempt}/{max_retries} 실패: {e}")
+            if lidar is not None:
+                try:
+                    lidar.disconnect()
+                except Exception:
+                    pass
+            time.sleep(1.5)
+    raise RuntimeError("라이다 연결 실패 - 케이블/전원을 확인하세요")
+
+
 def main():
     reset_mcu()
     time.sleep(0.5)
@@ -931,23 +975,22 @@ def main():
     global SPEED_FAST
     global SPEED_BACK
     global VELOCITY
-    global STEEL_CMD
-    # ===== 추가
-    global _pan_angle          # ★ 추가
-    # ===== 추가
 
     x = Picarx()
     wallBackup = WallBackup(x, Get_Drive_Duty())
     batteryMonitor = BatteryMonitor()
+    loadMonitor = SystemLoadMonitor()          # ===== [과부하 감시 추가] =====
 
     left_motor = Motor(PWM("P13"), Pin("D4"))
     right_motor = Motor(PWM("P12"), Pin("D5"))
     steer = Servo("P2")
 
     sonar = Ultrasonic(Pin("D2"), Pin("D3"))
-    lidar = RPLidar(LIDAR_PORT)
+    lidar = connect_lidar(LIDAR_PORT)
 
     # ===== [비전 추가] 카메라 시작 + 짐벌 각도 =====
+    # [단순화] 팬은 최초 1회 0도(정면)로 고정하고 이후 절대 움직이지 않는다.
+    #          (기존 버전의 스윕/추적 관련 서보 제어 코드는 전부 제거됨)
     start_vision()
     try:
         x.set_cam_tilt_angle(CAM_TILT_ANGLE)
@@ -1012,6 +1055,8 @@ def main():
             return -1
 
     print("라이다+초음파+카메라 주행 시작 (Ctrl+C 종료)")
+    print(f"[CPU부하] 코어 {loadMonitor.cores}개 감지, "
+          f"경고 기준 {Get_Load_Warn_Threshold():.1f}")   # ===== [과부하 감시 추가] =====
     steer.angle(0)
     time.sleep(1)
 
@@ -1024,133 +1069,194 @@ def main():
     current_backSpeed = backSpeed
     steel_gain_result = 0
 
+    # 0730 - 1:47 / 추가    
+    # mission_done = False
+    # try:
+    #   while not mission_done:
+    _arrived_notified = False
+
     try:
-        for scan in lidar.iter_scans(min_len=SCAN_MIN_LEN):
-            batteryMonitor.show()
+      while True:
+        # ===== 라이다 재연결 루프 =====
+        # 시리얼 스트림이 깨지면(RPLidarException) 여기서 잡아서
+        # 라이다를 재연결하고 스캔을 이어간다. 프로그램 자체는 죽지 않는다.
+        try:
+            for scan in lidar.iter_scans(min_len=SCAN_MIN_LEN):
+                batteryMonitor.show()
+                # ===== [과부하 감시 추가] =====
+                # BatteryMonitor와 동일한 패턴: interval마다만 실제로 읽고
+                # 출력하므로, 매 스캔마다 호출해도 루프에 부담 없음.
+                load1 = loadMonitor.show()
+                if load1 is not None:
+                    update_telemetry(load_1min=float(load1))
+                # ===== [과부하 감시 추가] 끝 =====
 
-            clear_angle, lidar_min = analyze_scan(scan)   # mm
-            ultra_cm = read_ultra_cm()                    # cm (-1이면 실패)
+                clear_angle, lidar_min = analyze_scan(scan)   # mm
+                ultra_cm = read_ultra_cm()                    # cm (-1이면 실패)
 
-            # ===== 후진 구간: picarx(WallBackup) 경로만 사용 =====
-            if (isBack and (backCnt <= current_backSpeed)):
-                duty = back_incre_Move(BACK_TARGET)
-                wallBackup.update(duty)
-                update_telemetry(state="BACKUP",
-                                 reason=f"후진 {backCnt}/{current_backSpeed}",
+                # ===== 후진 구간: picarx(WallBackup) 경로만 사용 =====
+                if (isBack and (backCnt <= current_backSpeed)):
+                    duty = back_incre_Move(BACK_TARGET)
+                    wallBackup.update(duty)
+                    update_telemetry(state="BACKUP",
+                                     reason=f"후진 {backCnt}/{current_backSpeed}",
+                                     ultra_cm=float(ultra_cm), lidar_mm=float(lidar_min),
+                                     speed=-duty, steer=0.0)
+                    print(f"[후진] duty={duty} ({backCnt}/{current_backSpeed})")
+                    backCnt += 1
+                    continue
+                else:
+                    if (isBack):
+                        print("후진 종료, 조향 :0")
+                        wallBackup.stop(steel_gain_result)
+                        SPEED_BACK = 0
+                        SPEED_FAST = 0
+                        isBackFlag = True
+                    isBack = False
+                    backCnt = 0
+
+                # =================================================================
+                # ===== [비전 추가] 미션 판단 : 반드시 1순위 정지 블록보다 위 =====
+                #   노란 오브젝트는 라이다에도 잡히므로, 30cm(STOP_DIST_MM)에서
+                #   기존 1순위가 먼저 발동하면 목표물 앞에서 후진해버림
+                #   (단, ultra_cm<=VERY_CLOSE_CM 일 땐 mission_step이 스스로
+                #    handled=False를 반환해 아래 탈출 로직으로 위임한다)
+                # =================================================================
+                cmd = mission_step(ultra_cm, lidar_min)
+        
+                if cmd.state == ARRIVED:
+                    set_decre_Move(0)
+                    left_motor.speed(0)
+                    right_motor.speed(0)
+                    set_steer(0)
+                    update_telemetry(state=ARRIVED, reason=cmd.reason,
+                                     ultra_cm=float(ultra_cm), lidar_mm=float(lidar_min),
+                                     speed=0, steer=0.0)
+                    if not _arrived_notified:
+                        print(f"★ 미션 완료: {cmd.reason} - 모터 정지 후 대기 중 (Ctrl+C로 종료)")
+                        _arrived_notified = True
+                    continue
+
+
+                if cmd.handled:
+                    if not cmd.allow_backup:
+                        # 접근 중에는 후진 상태를 강제로 눌러둔다
+                        isBack = False
+                        backCnt = 0
+                        isBackFlag = False
+                    steel_gain_result = cmd.steer
+                    set_speed(cmd.speed)
+                    set_steer(cmd.steer)
+                    update_telemetry(state=cmd.state, reason=cmd.reason,
+                                     ultra_cm=float(ultra_cm), lidar_mm=float(lidar_min),
+                                     speed=cmd.speed, steer=float(cmd.steer))
+                    print(f"[{cmd.state}] {cmd.reason}")
+                    continue
+                # ===== [비전 추가] 끝 - 아래는 기존 로직 그대로 =====
+
+                # ===== 1순위: 정지 (둘 중 하나라도 초근접) =====
+                if lidar_min < STOP_DIST_MM or (0 < ultra_cm < Get_Stop_Distance()):
+                    set_decre_Move(0)
+
+                    prev_steer = steel_gain_result   # 정지 직전까지 유지되던 조향각(=현재 바퀴 각도)
+
+                    # 초근접 + 조향각이 0이 아니면 -> 직진 후진으로 탈출
+                    if 0 < ultra_cm <= VERY_CLOSE_CM and abs(prev_steer) > STEER_RESET_TOL:
+                        steel_gain_result = 0.0
+                        set_steer(0)
+                        print(f"[탈출] 초근접({ultra_cm:.0f}cm) + 조향 {prev_steer:.0f}도 "
+                              f"-> 0도로 리셋 후 직진 후진")
+                        escape_reason = "초근접 조향리셋 탈출"
+                    else:
+                        steel_gain_result = clear_angle * STEER_GAIN
+                        set_steer(steel_gain_result)
+                        escape_reason = "일반 근접 정지"
+
+                    rear_cm = get_rear_min_cm(scan)
+                    current_backSpeed = compute_dynamic_backspeed(rear_cm, backSpeed)
+
+                    if current_backSpeed == 0:
+                        print(f"[후진 불가] 후방 {rear_cm}cm 이내 근접 - 후진 취소")
+                        isBack = False
+                    else:
+                        isBack = True
+                        backCnt = 0
+
+                    update_telemetry(state="STOP", reason=escape_reason,
+                                     ultra_cm=float(ultra_cm), lidar_mm=float(lidar_min),
+                                     speed=0, steer=float(steel_gain_result))
+                    continue
+
+                # ===== 2순위: 위험 → 감속 + 회피 조향 =====
+                if lidar_min < DANGER_DIST_MM or (0 < ultra_cm < Get_Stop_Distance()):
+                    set_speed(SPEED_SLOW)
+                    steel_gain_result = clear_angle * STEER_GAIN
+                    set_steer(steel_gain_result)
+                    update_telemetry(state="AVOID", reason="위험거리 회피",
+                                     ultra_cm=float(ultra_cm), lidar_mm=float(lidar_min),
+                                     speed=SPEED_SLOW, steer=float(steel_gain_result))
+                    print(f"[회피] 라이다 {lidar_min:.0f}mm 초음파 {ultra_cm:.0f}cm 트인 {clear_angle:.0f}도")
+                    continue
+
+                # ===== 3순위: 안전 → 정상 주행 =====
+                if lidar_min < STEER_ACTIVATE_DIST and abs(clear_angle) >= STEER_DEADZONE:
+                    steer_cmd = clear_angle * STEER_GAIN
+                    steel_gain_result = steer_cmd
+                else:
+                    steer_cmd = 0
+
+                if (not isBackFlag):
+                    set_steer(steer_cmd)
+
+                if (isBackFlag and steer_cmd == 0):
+                    isBackFlag = False
+
+                set_speed(VELOCITY)
+
+                update_telemetry(state="CRUISE", reason="정상 주행",
                                  ultra_cm=float(ultra_cm), lidar_mm=float(lidar_min),
-                                 speed=-duty, steer=0.0)
-                print(f"[후진] duty={duty} ({backCnt}/{current_backSpeed})")
-                backCnt += 1
-                continue
-            else:
-                if (isBack):
-                    print("후진 종료, 조향 :0")
-                    wallBackup.stop(steel_gain_result)
-                    SPEED_BACK = 0
-                    SPEED_FAST = 0
-                    isBackFlag = True
+                                 speed=VELOCITY, steer=float(steer_cmd))
+                print(f"[주행] 라이다 {lidar_min:.0f}mm 초음파 {ultra_cm:.0f}cm 조향 {steer_cmd:.0f}도")
+
+        except RPLidarException as e:
+            # 시리얼 스트림 손상(New scan flags mismatch, Descriptor length
+            # mismatch 등). 차는 안전하게 멈추고 라이다만 재연결한 뒤
+            # 바깥 while 루프가 스캔을 다시 시작한다. 프로그램은 죽지 않는다.
+            #
+            # ===== [과부하 감시 추가] =====
+            # 이 순간의 CPU 부하도 같이 남긴다. 라이다 오류가 CPU 과부하와
+            # 겹치는지(카메라/스트리밍 처리가 밀려서 시리얼 읽기를 놓친 건
+            # 아닌지) 확인하기 위함.
+            overload_note = ""
+            if loadMonitor.is_overloaded():
+                overload_note = (f" (당시 CPU부하 {loadMonitor.last_load1:.2f} - "
+                                  f"과부하 상태였음!)")
+            print(f"[라이다] 스캔 중 오류 발생: {e}{overload_note} -> 재연결 시도")
+            # ===== [과부하 감시 추가] 끝 =====
+            set_decre_Move(0)
+            set_steer(0)
+            update_telemetry(state="LIDAR_RECONNECT",
+                             reason=f"라이다 재연결 중: {e}",
+                             ultra_cm=-1.0, lidar_mm=-1.0, speed=0, steer=0.0)
+            try:
+                lidar.stop()
+                lidar.stop_motor()
+                lidar.disconnect()
+            except Exception:
+                pass
+            time.sleep(1.0)
+            try:
+                lidar = connect_lidar(LIDAR_PORT)
+                # 재연결 후 정지 상태에서 재개하도록 후진/조향 상태 초기화
                 isBack = False
                 backCnt = 0
-
-            # =================================================================
-            # ===== [비전 추가] 미션 판단 : 반드시 1순위 정지 블록보다 위 =====
-            #   노란 오브젝트는 라이다에도 잡히므로, 30cm(STOP_DIST_MM)에서
-            #   기존 1순위가 먼저 발동하면 목표물 앞에서 후진해버림
-            # =================================================================
-            cmd = mission_step(ultra_cm, lidar_min)
-
-            # ===== 추가
-            # ===== [팬 추적 추가] 서보 하드웨어 반영 =====
-            if abs(cmd.pan - _pan_angle) >= 0.5:
-                try:
-                    x.set_cam_pan_angle(cmd.pan)
-                except Exception as e:
-                    print(f"[비전] 팬 서보 제어 실패: {e}")
-            _pan_angle = cmd.pan
-            # ===== 추가
-
-
-            if cmd.state == ARRIVED:
-                set_decre_Move(0)
-                left_motor.speed(0)
-                right_motor.speed(0)
-                set_steer(0)
-                update_telemetry(state=ARRIVED, reason=cmd.reason,
-                                 ultra_cm=float(ultra_cm), lidar_mm=float(lidar_min),
-                                 speed=0, steer=0.0)
-                print(f"★ 미션 완료: {cmd.reason}")
-                break
-
-            if cmd.handled:
-                if not cmd.allow_backup:
-                    # 접근 중에는 후진 상태를 강제로 눌러둔다
-                    isBack = False
-                    backCnt = 0
-                    isBackFlag = False
-                steel_gain_result = cmd.steer
-                set_speed(cmd.speed)
-                set_steer(cmd.steer)
-                update_telemetry(state=cmd.state, reason=cmd.reason,
-                                 ultra_cm=float(ultra_cm), lidar_mm=float(lidar_min),
-                                 speed=cmd.speed, steer=float(cmd.steer))
-                print(f"[{cmd.state}] {cmd.reason}")
-                continue
-            # ===== [비전 추가] 끝 - 아래는 기존 로직 그대로 =====
-
-            # ===== 1순위: 정지 (둘 중 하나라도 초근접) =====
-            if lidar_min < STOP_DIST_MM or (0 < ultra_cm < Get_Stop_Distance()):
-                set_decre_Move(0)
-                steel_gain_result = clear_angle * STEER_GAIN
-                set_steer(steel_gain_result)
-
-                rear_cm = get_rear_min_cm(scan)
-                current_backSpeed = compute_dynamic_backspeed(rear_cm, backSpeed)
-
-                if current_backSpeed == 0:
-                    print(f"[후진 불가] 후방 {rear_cm}cm 이내 근접 - 후진 취소")
-                    isBack = False
-                else:
-                    rear_str = f"{rear_cm:.1f}cm" if rear_cm is not None else "측정불가"
-                    print(f"[정지] 라이다 {lidar_min:.0f}mm 초음파 {ultra_cm:.0f}cm 트인 {clear_angle:.0f}도 "
-                          f"| 후방 {rear_str} -> backSpeed {current_backSpeed}(기존 {backSpeed:.0f})")
-                    isBack = True
-                    backCnt = 0
-
-                update_telemetry(state="STOP", reason="초근접 정지",
-                                 ultra_cm=float(ultra_cm), lidar_mm=float(lidar_min),
-                                 speed=0, steer=float(steel_gain_result))
-                continue
-
-            # ===== 2순위: 위험 → 감속 + 회피 조향 =====
-            if lidar_min < DANGER_DIST_MM or (0 < ultra_cm < Get_Stop_Distance()):
-                set_speed(SPEED_SLOW)
-                steel_gain_result = clear_angle * STEER_GAIN
-                set_steer(steel_gain_result)
-                update_telemetry(state="AVOID", reason="위험거리 회피",
-                                 ultra_cm=float(ultra_cm), lidar_mm=float(lidar_min),
-                                 speed=SPEED_SLOW, steer=float(steel_gain_result))
-                print(f"[회피] 라이다 {lidar_min:.0f}mm 초음파 {ultra_cm:.0f}cm 트인 {clear_angle:.0f}도")
-                continue
-
-            # ===== 3순위: 안전 → 정상 주행 =====
-            if lidar_min < STEER_ACTIVATE_DIST and abs(clear_angle) >= STEER_DEADZONE:
-                steer_cmd = clear_angle * STEER_GAIN
-                steel_gain_result = steer_cmd
-            else:
-                steer_cmd = 0
-
-            if (not isBackFlag):
-                set_steer(steer_cmd)
-
-            if (isBackFlag and steer_cmd == 0):
                 isBackFlag = False
-
-            set_speed(VELOCITY)
-
-            update_telemetry(state="CRUISE", reason="정상 주행",
-                             ultra_cm=float(ultra_cm), lidar_mm=float(lidar_min),
-                             speed=VELOCITY, steer=float(steer_cmd))
-            print(f"[주행] 라이다 {lidar_min:.0f}mm 초음파 {ultra_cm:.0f}cm 조향 {steer_cmd:.0f}도")
+                SPEED_FAST = 0
+                SPEED_BACK = 0
+            except Exception as reconnect_err:
+                print(f"[라이다] 재연결 실패: {reconnect_err} - 5초 후 재시도")
+                time.sleep(5.0)
+            # while not mission_done 루프가 다시 for scan in ... 을 시작함
 
     except KeyboardInterrupt:
         print("\n종료 중...")
@@ -1163,6 +1269,10 @@ def main():
         lidar.stop()
         lidar.stop_motor()
         lidar.disconnect()
+        # ===== [과부하 감시 추가] =====
+        print(f"[CPU부하] 이번 실행 중 최고 부하: {loadMonitor.max_load1:.2f} "
+              f"(경고 기준 {Get_Load_Warn_Threshold():.1f})")
+        # ===== [과부하 감시 추가] 끝 =====
         print("정지 완료")
 
 

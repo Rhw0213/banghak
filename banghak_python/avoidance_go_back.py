@@ -22,7 +22,7 @@ avoidance_go_back.py
 def Get_Stop_Distance():
     """초음파 센서 전방 장애물 감지 범위
        후진으로 전환할 기준 거리(cm)를 반환. 이 숫자만 바꾸면 기준이 바뀜."""
-    return 5
+    return 10
 
 
 def Get_Drive_Duty():
