@@ -27,7 +27,7 @@ def build_arm(servo_factory):
     gripper = SmoothJoint(
         servo_factory("P7"), init_angle=0,
         # min_angle=-25, max_angle=0,       # 그리퍼: 완전히 닫히는 각도까지만
-        min_angle=-20, max_angle=10,       
+        min_angle=-20, max_angle=10,       # 그리퍼: 완전히 닫히는 각도까지만
         move_on_init=False
     )
 

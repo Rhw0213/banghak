@@ -52,7 +52,7 @@ def main(stdscr):
 
         time.sleep(0.02)
 
-    for j, target in zip([base, shoulder, elbow, gripper], [0, -30, 0, 0]):
+    for j, target in zip([base, shoulder, elbow, gripper], [0, 0, 0, 0]):
         j.move_to(target, speed=30)
 
 

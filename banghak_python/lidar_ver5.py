@@ -1,24 +1,19 @@
-# lidar_ultra_vision.py
+# lidar_ver5.py
 # 라이다 + 초음파 + 카메라(노란 오브젝트) 융합 주행 + 웹 스트리밍
 #
 # 카메라 획득: picamera2 (libcamera 스택). cv2.VideoCapture 사용 안 함.
 #
 # 실행:
-#   python3 lidar_ultra_vision.py            # 본 주행 (스트리밍 동시 동작)
-#   python3 lidar_ultra_vision.py calib      # 차량 정지 상태로 카메라 튜닝만
+#   python3 lidar_ver5.py            # 본 주행 (스트리밍 동시 동작)
+#   python3 lidar_ver5.py calib      # 차량 정지 상태로 카메라 튜닝만
 #
 # 브라우저에서 http://<라즈베리파이IP>:8000 접속
-#
-# 변경점 표시:
-#   [비전 추가]      - 카메라 인식 / 미션 FSM (단순화 버전)
-#   [스트리밍 추가]  - MJPEG 웹 스트리밍 + 실시간 HSV 튜닝 UI
-#   [단순화]         - 팬 서보 스윕/추적/FINAL/COOLDOWN 전부 제거.
-#                      카메라는 짐벌 정면(0도)에 고정한 채 절대 움직이지 않고,
-#                      조향은 오직 화면 오프셋(offset)만으로 결정한다.
-#   [재연결]         - RPLidarException 발생 시 자동 재연결 + 반복 재발 시 안전 종료
-#   [과부하 감시]    - os.getloadavg() 기반 시스템 부하 모니터 추가 (신규)
 
 import os
+import sys
+import select
+import tty
+import termios
 import time
 import threading
 import json
@@ -33,6 +28,7 @@ from picamera2 import Picamera2
 
 from rplidar import RPLidar, RPLidarException
 from robot_hat import Motor, Servo, Pin, PWM, reset_mcu, Ultrasonic
+from arm_setup import build_arm   # [로봇팔 추가] 관절을 SmoothJoint로 감싸서 반환
 
 from avoidance_go_back import Get_Stop_Distance, WallBackup, Get_Drive_Duty
 from picarx import Picarx
@@ -59,8 +55,7 @@ REAR_SAFETY_MARGIN_CM = 11
 DEFAULT_BACK_TARGET_CM = 60
 
 # 속도
-VELOCITY = 40
-# VELOCITY = 0
+VELOCITY = 45
 SPEED_FAST = 0
 SPEED_BACK = 0
 SPEED_SLOW = 30
@@ -69,95 +64,99 @@ SPEED_STEP = 3
 SCAN_MIN_LEN = 60
 
 # 초근접 탈출 (좁은 공간에서 조향 꺾인 채 후진하며 갇히는 것 방지)
-VERY_CLOSE_CM = 4          # 이 거리 이내는 "낀 상황"으로 간주 (ARRIVE_DISTANCE_CM보다 충분히 작게 유지)
-STEER_RESET_TOL = 3.0      # 이 각도 이상 꺾여 있으면 0으로 리셋 대상
+VERY_CLOSE_CM = 4
+STEER_RESET_TOL = 3.0
 
 # ===== [과부하 감시 추가] 시스템 부하(CPU) 설정 =====
-LOAD_CHECK_INTERVAL_SEC = 2.0     # 이 간격마다 부하를 읽고 표시
-LOAD_WARN_RATIO = 1.0             # 1분 평균 부하가 (코어 수 * 이 값)을 넘으면 경고
+LOAD_CHECK_INTERVAL_SEC = 2.0
+LOAD_WARN_RATIO = 1.0
 
 
 # =========================================================================
 # ===== [비전 추가] 카메라 / 노란 오브젝트 인식 설정 =====
 # =========================================================================
 
-CAM_WIDTH = 320             # 라즈베리파이4에서 라이다와 병행하려면 320x240 권장
+CAM_WIDTH = 320
 CAM_HEIGHT = 240
-CAM_FORMAT = "RGB888"       # picamera2에서 이 이름은 실제로 BGR 순서로 나옴(주의)
-CAM_TILT_ANGLE = 10        # 카메라 고개 들기
-CAM_SWAP_RB = False         # 스트림에서 노란 물체가 파랗게 보이면 웹 UI로 토글
+CAM_FORMAT = "RGB888"
+CAM_TILT_ANGLE = 10
+CAM_SWAP_RB = False
 
-# 노란색 HSV 범위 (OpenCV H는 0~179). 웹 UI 슬라이더로 실시간 변경 가능.
 COLOR_H_MIN, COLOR_H_MAX = 20, 35
 COLOR_S_MIN, COLOR_S_MAX = 100, 255
 COLOR_V_MIN, COLOR_V_MAX = 100, 255
 
-# 파란색 코드
-# COLOR_H_MIN, COLOR_H_MAX = 100, 125
-# COLOR_S_MIN, COLOR_S_MAX = 60, 255
-# COLOR_V_MIN, COLOR_V_MAX = 40, 255
-
 MIN_TARGET_AREA = 400
 
-# 거리 추정 (핀홀 모델): 거리cm = (실제폭cm * focal_px) / 화면폭px
-TARGET_REAL_WIDTH_CM = 8.0  # ★ 본인 오브젝트 실제 가로폭으로 수정
-CAM_FOCAL_PX = 528.0        # ★ 반드시 캘리브레이션 필요 (해상도 바꾸면 재측정)
+TARGET_REAL_WIDTH_CM = 8.0
+CAM_FOCAL_PX = 960.0
 
-ARRIVE_DISTANCE_CM = 10     # 이 거리 + 화면 중앙 정렬되면 도착 처리
-ARRIVE_CENTER_TOL = 0.15    # 도착 판정용 중앙 정렬 허용 오프셋
+ARRIVE_DISTANCE_CM = 10
+ARRIVE_CENTER_TOL = 0.15
 
 
 # =========================================================================
 # ===== [선반 정렬 추가] 초록색 선반(직사각형) 인식 설정 =====
-#   집는 대상은 그대로 노란 오브젝트(위 COLOR_*, TARGET_REAL_WIDTH_CM).
-#   선반 정면 한쪽 면에 칠한 "초록색"은 내비게이션/정밀주차 전용 기준이다.
-#   -> 장애물 판정이 훨씬 단순해진다: 초록이 보이면 선반(목표), 안 보이면
-#      라이다/초음파가 반응해도 무조건 장애물로 간주.
 # =========================================================================
 
-GREEN_H_MIN, GREEN_H_MAX = 45, 85      # ★ calib 모드에서 웹 UI로 실측 후 교체
+GREEN_H_MIN, GREEN_H_MAX = 45, 85
 GREEN_S_MIN, GREEN_S_MAX = 80, 255
 GREEN_V_MIN, GREEN_V_MAX = 60, 255
 
 MIN_SHELF_AREA = 500
 
-# 선반 정면에 칠한 초록색 면의 실제 가로폭(cm). ★ 반드시 실측해서 교체
-SHELF_REAL_WIDTH_CM = 20.0
-# 거리 추정에 쓰는 초점거리는 카메라가 같으므로 CAM_FOCAL_PX를 공유해서 사용한다.
+SHELF_REAL_WIDTH_CM = 10.0
 
-# ---- 도킹(정밀 주차) 단계 ----
-DOCK_ENTER_DISTANCE_CM = 40.0   # 이 거리 이내로 들어오면 APPROACH -> DOCK 전환
-DOCK_SPEED = 20                 # 도킹 중 크리핑 속도 (★ 10에서 전진이 안 걸려 15로 상향 - 실차로 더 조정 필요)
-DOCK_OFFSET_TOL = 0.05          # 도킹 완료 판정 - 좌우 정렬 허용 오차
-DOCK_SKEW_TOL = 0.15            # 도킹 완료 판정 - 틀어짐 허용 오차
-SKEW_STEER_GAIN = 20.0          # skew(-1~+1) -> 조향각 보정 계수
+DOCK_ENTER_DISTANCE_CM = 40.0
+DOCK_SPEED = 25
+DOCK_OFFSET_TOL = 0.05
+DOCK_SKEW_TOL = 0.15
+SKEW_STEER_GAIN = 20.0
+
+# [로봇팔 추가] 종료 시 팔을 0도로 복귀시킬 때 쓰는 속도(도/초)
+ARM_HOME_SPEED = 30.0
+
+# [로봇팔 슬로우스타터 시험 추가] 'p' 입력 시 실행되는 arm_slow_demo.py와
+# 동일한 패턴의 테스트 - 4관절을 +10도까지 이동했다가 잠깐 대기 후 0도로 복귀
+ARM_TEST_ANGLE = 20
+ARM_TEST_HOLD_SEC = 3.0
 
 
-# ===== [로봇팔 추가] 픽업 서보 설정 =====
-ARM_HOME_SHOULDER = 0
-ARM_HOME_ELBOW = 0
-ARM_GRAB_OPEN = 0
+def run_arm_slow_test(joints):
+    """
+    arm_slow_demo.py와 동일한 패턴: 0(혹은 현재각) -> ARM_TEST_ANGLE -> 0
+    새 Servo 객체를 만들지 않고, main()에서 이미 만든 joints를 그대로 재사용한다.
+    """
+    print(f"[로봇팔 테스트] 4관절 모두 {ARM_TEST_ANGLE}도까지 슬로우스타터로 이동 중...")
+    for j in joints:
+        j.move_to(ARM_TEST_ANGLE, speed=ARM_HOME_SPEED)
+    print(f"[로봇팔 테스트] 이동 완료 - {ARM_TEST_HOLD_SEC:.0f}초 대기 후 0도로 복귀합니다...")
+    time.sleep(ARM_TEST_HOLD_SEC)
+    print("[로봇팔 테스트] 0도로 슬로우스타터 복귀 중...")
+    for j in joints:
+        j.move_to(0, speed=ARM_HOME_SPEED)
+    print("[로봇팔 테스트] 복귀 완료 - 주행 재개")
 
-ARM_PICK_SHOULDER = -40   # ★ arm_calib.py로 실측 후 교체 (반드시 DOCK 완료 상태에서 측정)
-ARM_PICK_ELBOW = 20       # [블라인드 그랩 추가] 더 이상 사용 안 함 - 팔꿈치는 항상 ARM_HOME_ELBOW 고정
-ARM_GRAB_CLOSE = 0       # ★ arm_calib.py로 실측 후 교체
 
-ARM_MOVE_DELAY = 0.5
+def _check_keypress():
+    """
+    [로봇팔 슬로우스타터 시험 추가] 터미널이 cbreak 모드일 때, 지금 입력된
+    키가 있으면 논블로킹으로 읽어서 반환. 없으면 None. (Enter 없이 한 글자만
+    눌러도 즉시 감지됨 - main()에서 tty.setcbreak()로 미리 설정해둔 상태여야 함)
+    """
+    if select.select([sys.stdin], [], [], 0)[0]:
+        return sys.stdin.read(1)
+    return None
 
-ARM_STEP_DEG = 2         # 한 번에 움직이는 각도 (작을수록 부드러움)
-ARM_STEP_DELAY = 0.02    # 각 스텝 사이 대기시간(초) - 작을수록 빠름
-ARM_RAMP_STEPS = 6       # [슬로우스타터 추가] 이 스텝 수에 걸쳐 서서히 ARM_STEP_DEG까지 가속
 
-APPROACH_SPEED = 20
-TARGET_STEER_GAIN = 30.0    # 화면 오프셋(-1~+1) -> 조향각 변환 계수 (핵심)
+APPROACH_SPEED = 24
+TARGET_STEER_GAIN = 30.0
 LOST_TIMEOUT = 2.0
 DETOUR_TIME = 1.2
 DETOUR_STEER = 25.0
 CONFIRM_HITS = 3
-TARGET_TOLERANCE_RATIO = 0.35   # 목표물/장애물 판정 오차 허용 계수
+TARGET_TOLERANCE_RATIO = 0.35
 
-# 미션 상태: SEARCH -> APPROACH -> (필요시 DETOUR) -> DOCK -> ARRIVED
-# [선반 정렬 추가] DOCK: 선반 근접 후 저속으로 offset+skew를 동시에 정렬하는 정밀주차 단계
 SEARCH = "SEARCH"
 APPROACH = "APPROACH"
 DETOUR = "DETOUR"
@@ -169,16 +168,12 @@ class TargetInfo:
     def __init__(self, found=False, offset=0.0, distance_cm=-1.0,
                  area=0.0, width_px=0.0, box=None, ts=0.0, skew=0.0):
         self.found = found
-        self.offset = offset            # -1.0(맨왼쪽) ~ +1.0(맨오른쪽)
+        self.offset = offset
         self.distance_cm = distance_cm
         self.area = area
         self.width_px = width_px
-        self.box = box                  # (x, y, w, h) - 스트리밍 오버레이용
+        self.box = box
         self.ts = ts
-        # [선반 정렬 추가] 좌/우 변 높이 비대칭 기반 틀어짐 정도.
-        #   0.0 = 정면, >0 = 오른쪽 변이 더 큼(=차량이 왼쪽으로 틀어짐),
-        #   <0 = 왼쪽 변이 더 큼(=차량이 오른쪽으로 틀어짐)
-        #   노란 오브젝트 인식에는 사용하지 않고 항상 0.0
         self.skew = skew
 
     def is_fresh(self, max_age=0.5):
@@ -191,23 +186,18 @@ class TargetInfo:
         return self.found and abs(self.offset) < offset_tol and abs(self.skew) < skew_tol
 
 
-# ---- 카메라 스레드 공유 상태 ----
-# [선반 정렬 추가] 노란 오브젝트(집기 대상)와 초록 선반(주행/도킹 기준)을
-# 완전히 분리된 결과로 관리한다. 서로 다른 락/버퍼를 쓰는 이유는 웹 스트리밍
-# 스레드가 둘 중 하나만 참조하는 동안 다른 쪽이 갱신돼도 안전하게 하기 위함.
-_object_lock = threading.Lock()     # 노란 오브젝트
+_object_lock = threading.Lock()
 _object_result = TargetInfo()
-_shelf_lock = threading.Lock()      # 초록 선반
+_shelf_lock = threading.Lock()
 _shelf_result = TargetInfo()
 
 _vision_running = False
 _vision_thread = None
 _picam2 = None
 VISION_ENABLED = False
-VISION_ERROR = ""           # 실패 사유 (웹 화면에 표시)
+VISION_ERROR = ""
 
-# [선반 정렬 추가] 웹 튜닝 UI에서 지금 어느 색을 슬라이더로 조정 중인지
-EDIT_COLOR = "yellow"       # "yellow" | "green"
+EDIT_COLOR = "yellow"
 
 
 def get_yellow_hsv_range():
@@ -223,38 +213,24 @@ def get_green_hsv_range():
 
 
 def grab_frame():
-    """
-    picamera2에서 프레임을 받아 OpenCV용 BGR 3채널로 정규화해서 반환.
-    실패하면 None.
-    """
     try:
         arr = _picam2.capture_array()
     except Exception:
         return None
-
     if arr is None:
         return None
-
     if arr.ndim == 3 and arr.shape[2] == 4:
         frame = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
     elif arr.ndim == 3 and arr.shape[2] == 3:
         frame = arr
     else:
         return None
-
     if CAM_SWAP_RB:
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-
     return frame
 
 
 def _compute_skew(mask, bx, by, bw, bh):
-    """
-    [선반 정렬 추가] 사각형 블롭의 좌/우 변 화면상 "높이"를 비교해 틀어짐(skew) 추정.
-    원근 때문에 카메라에 더 가까운 변이 화면에서 더 크게(길게) 찍히는 원리 이용.
-      skew > 0 : 오른쪽 변이 더 큼 -> 오른쪽이 더 가까움 -> 차량은 왼쪽으로 틀어져 있음
-      skew < 0 : 왼쪽 변이 더 큼   -> 왼쪽이 더 가까움   -> 차량은 오른쪽으로 틀어져 있음
-    """
     if bw < 8:
         return 0.0
     roi = mask[by:by + bh, bx:bx + bw]
@@ -268,35 +244,25 @@ def _compute_skew(mask, bx, by, bw, bh):
 
 
 def detect_color(frame, lower, upper, min_area, real_width_cm, compute_skew=False):
-    """
-    프레임에서 [lower, upper] HSV 범위의 가장 큰 덩어리를 찾아 (TargetInfo, mask) 반환.
-    노란 오브젝트/초록 선반 인식에 공용으로 쓰는 범용 함수.
-    """
     h, w = frame.shape[:2]
-
     blurred = cv2.GaussianBlur(frame, (5, 5), 0)
     hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, lower, upper)
-
     kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)    # 점 노이즈 제거
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)   # 구멍 메우기
-
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return TargetInfo(found=False, ts=time.time()), mask
-
     largest = max(contours, key=cv2.contourArea)
     area = cv2.contourArea(largest)
     if area < min_area:
         return TargetInfo(found=False, ts=time.time()), mask
-
     bx, by, bw, bh = cv2.boundingRect(largest)
     cx = bx + bw / 2.0
     offset = (cx - w / 2.0) / (w / 2.0)
     distance = (real_width_cm * CAM_FOCAL_PX) / bw if bw > 0 else -1.0
     skew = _compute_skew(mask, bx, by, bw, bh) if compute_skew else 0.0
-
     info = TargetInfo(found=True, offset=offset, distance_cm=distance,
                       area=area, width_px=float(bw), box=(bx, by, bw, bh),
                       ts=time.time(), skew=skew)
@@ -304,14 +270,12 @@ def detect_color(frame, lower, upper, min_area, real_width_cm, compute_skew=Fals
 
 
 def detect_yellow(frame):
-    """노란 오브젝트(집기 대상) 인식. skew는 계산하지 않음(항상 0)."""
     lower, upper = get_yellow_hsv_range()
     return detect_color(frame, lower, upper, MIN_TARGET_AREA,
                         TARGET_REAL_WIDTH_CM, compute_skew=False)
 
 
 def detect_shelf(frame):
-    """[선반 정렬 추가] 초록 선반(주행/도킹 기준) 인식. skew 계산 포함."""
     lower, upper = get_green_hsv_range()
     return detect_color(frame, lower, upper, MIN_SHELF_AREA,
                         SHELF_REAL_WIDTH_CM, compute_skew=True)
@@ -321,7 +285,6 @@ def _vision_loop():
     global _object_result, _shelf_result
     last_stream = 0.0
     fail_count = 0
-
     while _vision_running:
         frame = grab_frame()
         if frame is None:
@@ -331,22 +294,16 @@ def _vision_loop():
             time.sleep(0.05)
             continue
         fail_count = 0
-
-        # [선반 정렬 추가] 노란 오브젝트 / 초록 선반을 매 프레임 각각 인식
         obj_info, obj_mask = detect_yellow(frame)
         shelf_info, shelf_mask = detect_shelf(frame)
-
         with _object_lock:
             _object_result = obj_info
         with _shelf_lock:
             _shelf_result = shelf_info
-
-        # ===== [스트리밍 추가] 보는 사람이 있을 때만 인코딩 (CPU 절약) =====
         now = time.time()
         if _stream_clients > 0 and (now - last_stream) >= (1.0 / STREAM_FPS):
             last_stream = now
             _publish_frame(frame, obj_mask, shelf_mask, obj_info, shelf_info)
-
         time.sleep(0.01)
 
 
@@ -358,13 +315,11 @@ def start_vision():
             main={"size": (CAM_WIDTH, CAM_HEIGHT), "format": CAM_FORMAT})
         _picam2.configure(config)
         _picam2.start()
-        time.sleep(1.0)     # 센서 안정화. 이거 없으면 첫 프레임이 검게 나온다
-
+        time.sleep(1.0)
         test = _picam2.capture_array()
         if test is None:
             raise RuntimeError("capture_array()가 None 반환")
         print(f"[비전] 첫 프레임 shape={test.shape}")
-
         _vision_running = True
         _vision_thread = threading.Thread(target=_vision_loop, daemon=True)
         _vision_thread.start()
@@ -392,40 +347,21 @@ def stop_vision():
 
 
 def get_object():
-    """노란 오브젝트(집기 대상) 최신 인식 결과"""
     with _object_lock:
         return _object_result
 
 
 def get_shelf():
-    """[선반 정렬 추가] 초록 선반(주행/도킹 기준) 최신 인식 결과"""
     with _shelf_lock:
         return _shelf_result
 
 
-# =========================================================================
-# ===== [과부하 감시 추가] 시스템 부하(CPU) 모니터 =====
-#   BatteryMonitor와 완전히 같은 패턴: interval마다만 실제로 읽고 출력해서
-#   메인 루프에 부담을 주지 않는다.
-#
-#   os.getloadavg()는 "CPU 사용률(%)"이 아니라 "실행 대기 중인 프로세스
-#   평균 개수(1분 이동평균)"다. 코어 수보다 이 값이 크면 CPU가 감당 못 하는
-#   작업이 쌓이고 있다는 뜻으로 해석한다 (예: 4코어 기준 4.0 초과 시 과부하 의심).
-# =========================================================================
-
 def Get_Load_Warn_Threshold():
-    """이 부하(1분 평균) 이상이면 '과부하' 경고를 표시할 기준값"""
     cores = os.cpu_count() or 1
     return cores * LOAD_WARN_RATIO
 
 
 class SystemLoadMonitor:
-    """
-    주행 중 CPU 부하(load average)를 주기적으로 읽어서 표시하는 부품.
-    BatteryMonitor와 동일한 사용 패턴: 메인 루프에서 show()를 반복 호출하면,
-    정해진 간격마다만 실제로 읽고 출력한다.
-    """
-
     def __init__(self, interval=LOAD_CHECK_INTERVAL_SEC):
         self.interval = interval
         self.last_time = 0
@@ -434,7 +370,6 @@ class SystemLoadMonitor:
         self.cores = os.cpu_count() or 1
 
     def read(self):
-        """지금 1분 평균 부하를 읽어서 반환. 실패 시 None."""
         try:
             load1, load5, load15 = os.getloadavg()
             if load1 > self.max_load1:
@@ -445,20 +380,14 @@ class SystemLoadMonitor:
             return None
 
     def show(self):
-        """
-        interval이 지났을 때만 부하를 읽고 한 줄 출력.
-        반환값: 방금 표시했으면 load1(float), 아니면 None
-        """
         now = time.time()
         if now - self.last_time < self.interval:
             return None
-
         self.last_time = now
         load1 = self.read()
         if load1 is None:
             print("[CPU부하] 읽기 실패")
             return None
-
         threshold = Get_Load_Warn_Threshold()
         warn = f"  <-- 과부하 의심! (코어 {self.cores}개)" if load1 > threshold else ""
         print(f"##[CPU부하] {load1:.2f}  (최고 {self.max_load1:.2f}, "
@@ -466,7 +395,6 @@ class SystemLoadMonitor:
         return load1
 
     def is_overloaded(self):
-        """지금까지 마지막으로 읽은 값 기준, 과부하 상태인지 여부."""
         if self.last_load1 is None:
             return False
         return self.last_load1 > Get_Load_Warn_Threshold()
@@ -477,17 +405,16 @@ class SystemLoadMonitor:
 # =========================================================================
 
 STREAM_PORT = 8000
-STREAM_FPS = 10             # 높이면 주행 루프가 느려짐
-STREAM_QUALITY = 60         # JPEG 품질 (낮출수록 가벼움)
-STREAM_SHOW_MASK = False    # True면 원본 대신 마스크(흑백) 전송 - HSV 튜닝용
+STREAM_FPS = 10
+STREAM_QUALITY = 60
+STREAM_SHOW_MASK = False
 
 _stream_lock = threading.Lock()
 _stream_jpeg = None
-_stream_clients = 0         # 접속자 수. 0이면 인코딩 자체를 건너뜀
+_stream_clients = 0
 _stream_server = None
-_app_running = True         # 종료 시 스트림 루프를 빠져나오기 위한 플래그
+_app_running = True
 
-# 메인 루프가 갱신하는 텔레메트리 (웹 상태창에 표시)
 _telemetry = {
     "state": SEARCH,
     "reason": "-",
@@ -495,7 +422,7 @@ _telemetry = {
     "lidar_mm": -1.0,
     "speed": 0,
     "steer": 0.0,
-    "load_1min": 0.0,          # ===== [과부하 감시 추가] =====
+    "load_1min": 0.0,
 }
 _telemetry_lock = threading.Lock()
 
@@ -506,7 +433,6 @@ def update_telemetry(**kwargs):
 
 
 def _make_placeholder(text):
-    """카메라가 없을 때 보여줄 안내 프레임 JPEG 생성"""
     img = np.zeros((CAM_HEIGHT, CAM_WIDTH, 3), np.uint8)
     img[:] = (30, 30, 30)
     cv2.putText(img, "NO CAMERA", (int(CAM_WIDTH * 0.12), int(CAM_HEIGHT * 0.45)),
@@ -520,21 +446,14 @@ def _make_placeholder(text):
 
 
 def _draw_overlay(frame, obj_info, shelf_info):
-    """검출 결과(노란 오브젝트 + 초록 선반)를 프레임에 그려서 반환"""
     h, w = frame.shape[:2]
     out = frame.copy()
-
-    # 화면 중앙선 (조향 기준선)
     cv2.line(out, (w // 2, 0), (w // 2, h), (200, 200, 200), 1)
-
-    # 노란 오브젝트 (노란 박스)
     if obj_info.found and obj_info.box:
         bx, by, bw, bh = obj_info.box
         cv2.rectangle(out, (bx, by), (bx + bw, by + bh), (0, 220, 255), 2)
         cv2.putText(out, f"OBJ {obj_info.distance_cm:.0f}cm", (bx, max(15, by - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 255), 1)
-
-    # [선반 정렬 추가] 초록 선반 (초록 박스 + skew 표시)
     if shelf_info.found and shelf_info.box:
         bx, by, bw, bh = shelf_info.box
         cv2.rectangle(out, (bx, by), (bx + bw, by + bh), (0, 255, 0), 2)
@@ -545,11 +464,9 @@ def _draw_overlay(frame, obj_info, shelf_info):
         cv2.putText(out, f"SHELF {shelf_info.distance_cm:.0f}cm skew={shelf_info.skew:+.2f}",
                     (bx, min(h - 5, by + bh + 15)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
-
     with _telemetry_lock:
         state = _telemetry["state"]
         ultra = _telemetry["ultra_cm"]
-
     if shelf_info.found:
         txt = f"{state} shelf off={shelf_info.offset:+.2f} skew={shelf_info.skew:+.2f} ultra={ultra:.0f}cm"
     else:
@@ -560,14 +477,12 @@ def _draw_overlay(frame, obj_info, shelf_info):
 
 
 def _publish_frame(frame, obj_mask, shelf_mask, obj_info, shelf_info):
-    """카메라 스레드가 호출. 최신 JPEG을 스트리밍 버퍼에 넣는다."""
     global _stream_jpeg
     if STREAM_SHOW_MASK:
         mask = shelf_mask if EDIT_COLOR == "green" else obj_mask
         img = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
     else:
         img = _draw_overlay(frame, obj_info, shelf_info)
-
     ok, buf = cv2.imencode('.jpg', img,
                            [int(cv2.IMWRITE_JPEG_QUALITY), STREAM_QUALITY])
     if ok:
@@ -621,7 +536,7 @@ function send(){
 P.forEach(([k])=>document.getElementById(k).addEventListener('input',send));
 function setColor(c){
   curColor=c;
-  window._init=false;   // 다음 poll에서 슬라이더 값을 새 색상 값으로 다시 채움
+  window._init=false;
   fetch('/set?editcolor='+c);
   document.getElementById('btn_yellow').style.opacity = (c==='yellow')?1:0.5;
   document.getElementById('btn_green').style.opacity = (c==='green')?1:0.5;
@@ -660,7 +575,7 @@ setInterval(poll,400);poll();
 
 class _StreamHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):
-        pass    # 요청 로그로 터미널이 도배되는 것 방지
+        pass
 
     def do_GET(self):
         global _stream_clients, STREAM_SHOW_MASK, CAM_SWAP_RB, EDIT_COLOR
@@ -730,8 +645,6 @@ class _StreamHandler(BaseHTTPRequestHandler):
                 except Exception:
                     return cur
 
-            # [선반 정렬 추가] color=yellow|green 파라미터로 어느 쪽 HSV를
-            # 갱신할지 결정. 파라미터가 없으면 현재 EDIT_COLOR를 그대로 사용.
             target_color = q.get('color', [EDIT_COLOR])[0]
 
             if target_color == 'green':
@@ -797,7 +710,6 @@ class _StreamHandler(BaseHTTPRequestHandler):
                     with _stream_lock:
                         buf = _stream_jpeg
                     if buf is None:
-                        # 카메라가 죽었어도 안내 화면은 계속 보내준다
                         buf = _make_placeholder(VISION_ERROR or "no frame yet")
                     if buf is None:
                         time.sleep(0.1)
@@ -810,7 +722,7 @@ class _StreamHandler(BaseHTTPRequestHandler):
                     self.wfile.write(b'\r\n')
                     time.sleep(1.0 / STREAM_FPS)
             except (BrokenPipeError, ConnectionResetError):
-                pass    # 브라우저 탭 닫힘 - 정상
+                pass
             finally:
                 _stream_clients -= 1
         else:
@@ -851,18 +763,6 @@ def stop_stream():
 
 # =========================================================================
 # ===== [비전 추가] 미션 FSM =====
-#   SEARCH -> APPROACH -> (필요시 DETOUR로 잠깐 우회) -> DOCK -> ARRIVED
-#   카메라 팬은 항상 정면 고정 (스윕/추적 없음).
-#
-#   [선반 정렬 추가] 내비게이션/장애물 판정 기준을 노란 오브젝트에서
-#   초록 선반(shelf)으로 변경. 노란 오브젝트는 더 이상 주행 판단에 쓰이지
-#   않고, 로봇팔이 실제로 집을 대상으로만 남는다 (main()의 픽업 단계에서
-#   get_object()로 존재 여부만 참고).
-#
-#   DOCK(신규): 선반이 DOCK_ENTER_DISTANCE_CM 이내로 들어오면 진입.
-#   저속 크리핑하며 offset(좌우 위치)뿐 아니라 skew(선반 대비 차량이
-#   얼마나 틀어졌는지)까지 동시에 조향에 반영해, 로봇팔이 집을 수 있는
-#   정밀한 위치+각도로 수렴시킨다.
 # =========================================================================
 
 MISSION_STATE = SEARCH
@@ -877,14 +777,8 @@ MAX_DETOUR_REPEAT = 3
 
 
 def is_the_shelf(shelf, ultra_cm):
-    """
-    전방 물체가 선반(목표)인지 장애물인지 판정.
-    카메라 추정거리와 초음파 거리가 비슷하면 선반, 크게 다르면 앞에 낀 장애물.
-    (초록은 선반 전용 색이므로 노란 오브젝트보다 오탐 가능성이 낮다)
-    """
     if not shelf.found or ultra_cm <= 0 or shelf.distance_cm <= 0:
         return False
-    # 화면 안에만 있으면 판정 대상 (중앙 정렬 조건은 넓게 완화)
     if abs(shelf.offset) > 0.8:
         return False
     tolerance = max(10.0, shelf.distance_cm * TARGET_TOLERANCE_RATIO)
@@ -892,10 +786,6 @@ def is_the_shelf(shelf, ultra_cm):
 
 
 class Command:
-    """
-    handled=False -> 기존 라이다 회피 로직 그대로 실행
-    handled=True  -> speed/steer 적용. allow_backup=False면 후진 금지
-    """
     def __init__(self, handled=False, speed=0, steer=0.0,
                  allow_backup=True, state=SEARCH, reason=""):
         self.handled = handled
@@ -907,7 +797,6 @@ class Command:
 
 
 def _dock_steer(shelf):
-    """[선반 정렬 추가] offset+skew를 함께 반영한 도킹용 조향각 계산"""
     return max(-STEER_LIMIT, min(STEER_LIMIT,
                shelf.offset * TARGET_STEER_GAIN + shelf.skew * SKEW_STEER_GAIN))
 
@@ -919,7 +808,7 @@ def mission_step(ultra_cm, lidar_min):
     if not VISION_ENABLED:
         return Command(handled=False, state=SEARCH, reason="비전 비활성")
 
-    shelf = get_shelf()   # [선반 정렬 추가] 주행 판단은 이제 초록 선반 기준
+    shelf = get_shelf()
     now = time.time()
 
     if shelf.found and shelf.is_fresh():
@@ -930,14 +819,10 @@ def mission_step(ultra_cm, lidar_min):
     else:
         _hit_count = 0
 
-    # ---------- ARRIVED ----------
     if MISSION_STATE == ARRIVED:
-        # 로봇팔이 잡는 동안 정지 유지 (재탐색 없음 - 필요시 프로그램 재실행)
         return Command(handled=True, speed=0, steer=0.0, allow_backup=False,
                        state=ARRIVED, reason="선반 도킹 완료 - 정지 유지")
 
-    # ---------- SEARCH ----------
-    # 카메라 스윕 없음 - 짐벌은 main()에서 최초 1회 0도로 고정된 채 유지된다.
     if MISSION_STATE == SEARCH:
         if _hit_count >= CONFIRM_HITS:
             print(f"[미션] 선반 발견(거리≈{shelf.distance_cm:.0f}cm) -> APPROACH")
@@ -945,7 +830,6 @@ def mission_step(ultra_cm, lidar_min):
         else:
             return Command(handled=False, state=SEARCH, reason="탐색 중")
 
-    # ---------- DETOUR ----------
     if MISSION_STATE == DETOUR:
         if now - _detour_start > DETOUR_TIME:
             print("[미션] 우회 종료 -> APPROACH 복귀")
@@ -958,8 +842,6 @@ def mission_step(ultra_cm, lidar_min):
                            steer=_detour_dir * DETOUR_STEER, allow_backup=True,
                            state=DETOUR, reason="장애물 우회 중")
 
-    # ---------- DOCK ----------
-    # [선반 정렬 추가] 정밀 주차: 저속 크리핑 + offset/skew 동시 보정
     if MISSION_STATE == DOCK:
         if 0 < ultra_cm <= VERY_CLOSE_CM:
             return Command(handled=False, state=DOCK,
@@ -970,14 +852,12 @@ def mission_step(ultra_cm, lidar_min):
                 print("[미션] 도킹 중 선반 상실 -> SEARCH 복귀")
                 MISSION_STATE = SEARCH
                 return Command(handled=False, state=SEARCH, reason="선반 상실")
-            # 잠깐 놓친 경우: 마지막 offset/skew로 관성 크리핑 (급격한 변화 방지)
             steer = max(-STEER_LIMIT, min(STEER_LIMIT,
                         _last_offset * TARGET_STEER_GAIN + _last_skew * SKEW_STEER_GAIN))
             return Command(handled=True, speed=DOCK_SPEED, steer=steer,
                            allow_backup=False, state=DOCK,
                            reason="도킹 중 일시 상실 - 관성 크리핑")
 
-        # 도착 판정: 거리 + 좌우 정렬 + 틀어짐 모두 좁은 허용치 이내
         if 0 < ultra_cm <= ARRIVE_DISTANCE_CM and shelf.is_docked():
             print(f"[미션] 선반 {ultra_cm:.0f}cm 도킹 완료 "
                   f"(offset={shelf.offset:+.2f} skew={shelf.skew:+.2f}) -> 정지")
@@ -990,8 +870,6 @@ def mission_step(ultra_cm, lidar_min):
                        reason=f"도킹 offset={shelf.offset:+.2f} skew={shelf.skew:+.2f} "
                               f"거리={ultra_cm:.0f}cm")
 
-    # ---------- APPROACH ----------
-    # 안전핀: 초근접이면 미션 로직이 뭘 하려 했든 기존 탈출(정지+후진) 로직에 위임한다.
     if 0 < ultra_cm <= VERY_CLOSE_CM:
         return Command(handled=False, state=APPROACH, reason="접근 중 초근접 - 기존 탈출로 위임")
 
@@ -1000,24 +878,20 @@ def mission_step(ultra_cm, lidar_min):
             print("[미션] 선반 상실 -> SEARCH 복귀")
             MISSION_STATE = SEARCH
             return Command(handled=False, state=SEARCH, reason="선반 상실")
-        # 잠깐 놓친 경우: 마지막 오프셋으로 관성 주행
         return Command(handled=True, speed=APPROACH_SPEED,
                        steer=_last_offset * TARGET_STEER_GAIN, allow_backup=False,
                        state=APPROACH, reason="일시 상실 - 관성 주행")
 
-    # 1순위: 도킹 진입 판정 (선반이 충분히 가까워지면 저속 정밀주차로 전환)
     if 0 < ultra_cm <= DOCK_ENTER_DISTANCE_CM and shelf.is_centered(0.3):
         print(f"[미션] 선반 {ultra_cm:.0f}cm 근접 -> DOCK 진입")
         MISSION_STATE = DOCK
         return Command(handled=True, speed=DOCK_SPEED, steer=_dock_steer(shelf),
                        allow_backup=False, state=DOCK, reason="도킹 진입")
 
-    # 2순위: 앞을 막은 게 선반이 아니면 우회
     blocked = (0 < ultra_cm < 25) or (0 < lidar_min < STOP_DIST_MM)
     if blocked and not is_the_shelf(shelf, ultra_cm):
         _detour_repeat_count += 1
         if _detour_repeat_count >= MAX_DETOUR_REPEAT:
-            # 같은 자리에서 우회만 반복 중 -> 오판 가능성 높음. 강제 접근 시도
             print(f"[미션] 우회 {_detour_repeat_count}회 반복 -> 강제 접근 전환")
             _detour_repeat_count = 0
         else:
@@ -1030,27 +904,23 @@ def mission_step(ultra_cm, lidar_min):
                            steer=_detour_dir * DETOUR_STEER, allow_backup=True,
                            state=DETOUR, reason="우회 시작")
     else:
-        _detour_repeat_count = 0   # 정상 접근 중이면 카운터 리셋
+        _detour_repeat_count = 0
 
-    # 3순위: 정상 접근 - 화면 오프셋으로 조향 (도킹 진입 전까지는 skew 무시)
     steer = max(-STEER_LIMIT, min(STEER_LIMIT, shelf.offset * TARGET_STEER_GAIN))
-    speed = max(1, int(VELOCITY * 0.7))   # ★ 선반 발견 -> 항상 절반 속도
+    speed = max(1, int(VELOCITY * 0.7))
     if 0 < ultra_cm < 30:
-        speed = max(18, int(APPROACH_SPEED * 0.5))  # 더 가까워지면 한 번 더 감속(선택)
+        speed = max(18, int(APPROACH_SPEED * 0.5))
 
     return Command(handled=True, speed=speed, steer=steer, allow_backup=False,
                    state=APPROACH,
                    reason=f"접근 오프셋={shelf.offset:+.2f} "
-                          f"카메라≈{shelf.distance_cm:.0f}cm 초음파={ultra_cm:.0f}cm")
+                          f"카메라≈{shelf.distance_cm:.0f}cm 초음파={ultra_cm:.0f}cm "
+                          f"라이다={lidar_min:.0f}mm")
 
 
 def calibrate_vision():
-    """
-    차량을 움직이지 않고 카메라만 튜닝하는 모드.
-      python3 lidar_ultra_vision.py calib
-    """
     start_vision()
-    start_stream()      # 카메라가 실패해도 안내 화면을 보여주기 위해 항상 시작
+    start_stream()
     print("캘리브레이션 모드. 브라우저에서 튜닝하세요. Ctrl+C 종료")
     try:
         while True:
@@ -1081,79 +951,6 @@ def calibrate_vision():
         stop_vision()
         print("종료")
 
-# [블라인드 그랩 추가] 카메라로는 선반 vs 장애물 구분+접근까지만 가능하고,
-# 근접 후 오브젝트를 시각적으로 추적할 수는 없다(하드웨어 한계).
-# 대신 DOCK 단계에서 차량을 매번 거의 동일한 위치/각도로 정밀 정차시키므로,
-# "이쯤에 오브젝트가 있을 것"이라는 고정 캘리브레이션 값으로 팔꿈치 없이
-# 어깨+그랩만 움직여서 눈 감고 집는다.
-#   ※ 이 전략이 성립하려면 DOCK_OFFSET_TOL/DOCK_SKEW_TOL이 충분히 타이트해야
-#     하고, ARM_PICK_SHOULDER/ARM_GRAB_CLOSE는 반드시 DOCK 완료 조건을 실제로
-#     만족한 상태에서 실측해야 한다 (대충 세워두고 측정하면 실전에서 어긋남).
-def pick_up_target(shoulder_servo, grab_servo):
-    """ARRIVED 상태에서 한 번 호출: 그립 열고 -> 어깨 내리기 -> 그립 닫기 -> 어깨 복귀 (부드럽게)"""
-    print("[로봇팔] 픽업 시퀀스 시작 (어깨+그랩만 사용, 팔꿈치는 홈 고정)")
-
-    smooth_servo_move(grab_servo, ARM_GRAB_OPEN, ARM_GRAB_CLOSE)
-    time.sleep(ARM_MOVE_DELAY)
-
-    smooth_servo_move(shoulder_servo, ARM_PICK_SHOULDER, ARM_HOME_SHOULDER)
-    time.sleep(ARM_MOVE_DELAY)
-
-    smooth_servo_move(grab_servo, ARM_GRAB_CLOSE, ARM_GRAB_OPEN)
-    time.sleep(ARM_MOVE_DELAY)
-
-    smooth_servo_move(shoulder_servo, ARM_HOME_SHOULDER, ARM_PICK_SHOULDER)
-    time.sleep(ARM_MOVE_DELAY)
-
-    print("[로봇팔] 픽업 시퀀스 완료")
-
-# 팔 움직임 부드럽게 [슬로우스타터 추가] 출발 시 작은 스텝으로 시작해
-# ARM_RAMP_STEPS에 걸쳐 점점 ARM_STEP_DEG까지 가속 (급출발로 인한 기구 충격/흔들림 방지)
-def smooth_servo_move(servo, target_angle, current_angle,
-                       step_deg=ARM_STEP_DEG, step_delay=ARM_STEP_DELAY,
-                       ramp_steps=ARM_RAMP_STEPS):
-    """
-    서보를 current_angle에서 target_angle까지 조금씩 나눠서 이동.
-    끝나면 실제로 도달한 각도(target_angle)를 반환 -> 다음 호출의 current_angle로 사용
-    """
-    if current_angle == target_angle:
-        return target_angle
-
-    direction = 1 if target_angle > current_angle else -1
-    angle = current_angle
-    i = 0
-    done = False
-    while not done:
-        # [슬로우스타터 추가] i번째 스텝의 크기 = step_deg * (i+1)/ramp_steps (최대 step_deg로 수렴)
-        ramp_ratio = min(1.0, (i + 1) / ramp_steps)
-        cur_step = max(0.5, step_deg * ramp_ratio)
-        i += 1
-
-        if direction > 0:
-            angle = min(angle + cur_step, target_angle)
-            done = angle >= target_angle
-        else:
-            angle = max(angle - cur_step, target_angle)
-            done = angle <= target_angle
-
-        servo.angle(angle)
-        time.sleep(step_delay)
-    return target_angle
-
-
-# [초기화 추가] 전원 인가 직후 서보의 실제 물리적 각도는 알 방법이 없다
-# (위치 피드백이 없는 저가 서보). 이 코드가 다루는 각도 범위 중 가장 먼
-# 지점(ARM_PICK_*/ARM_GRAB_CLOSE)에서 출발했다고 가정하고, 그 가정을
-# 기준으로 슬로우스타터를 거쳐 0도(홈)까지 부드럽게 복귀시킨다.
-#   ※ 한계: 만약 실제 각도가 이 가정과 다르면(예: 이미 0도 근처였다면)
-#     서보가 처음 명령을 받는 순간 그 차이만큼은 순간적으로 이동한다.
-#     완전한 슬로우스타트를 보장하려면 위치 피드백이 있는 서보가 필요하다.
-def init_arm_home(shoulder_servo, elbow_servo, grab_servo):
-    print("[로봇팔] 초기화 - 슬로우스타터로 0도(홈) 복귀 중...")
-    smooth_servo_move(shoulder_servo, ARM_HOME_SHOULDER, ARM_PICK_SHOULDER)
-    smooth_servo_move(elbow_servo, ARM_HOME_ELBOW, ARM_PICK_ELBOW)
-    smooth_servo_move(grab_servo, ARM_GRAB_OPEN, ARM_GRAB_CLOSE)
-    print("[로봇팔] 초기화 완료")
 
 # =========================================================================
 # ===== 기존 라이다 유틸 (로직 변경 없음) =====
@@ -1167,7 +964,6 @@ def normalize_angle(angle):
 
 
 def analyze_scan(scan):
-    """가장 트인 방향 + 정면 최소거리(mm)"""
     best_angle = 0
     best_distance = 0
     front_min = 99999
@@ -1185,7 +981,6 @@ def analyze_scan(scan):
 
 
 def get_rear_min_cm(scan, sector_deg=REAR_SECTOR_DEG):
-    """후방(±sector_deg) 섹터 내 최소거리(cm). 감지 없으면 None"""
     min_mm = None
     for quality, angle, distance in scan:
         if distance <= 0:
@@ -1200,7 +995,6 @@ def get_rear_min_cm(scan, sector_deg=REAR_SECTOR_DEG):
 
 
 def compute_dynamic_backspeed(rear_cm, base_backspeed):
-    """후방 여유거리에 비례해 backSpeed 계산. 0이면 후진 금지."""
     if rear_cm is None:
         return base_backspeed
     available_cm = rear_cm - REAR_SAFETY_MARGIN_CM
@@ -1211,10 +1005,6 @@ def compute_dynamic_backspeed(rear_cm, base_backspeed):
 
 
 def connect_lidar(port, max_retries=5):
-    """
-    라이다 연결 + 리셋. 시리얼 스트림이 꼬여있을 수 있으므로
-    stop/reset 후 약간의 대기시간을 두고 health를 확인한다.
-    """
     for attempt in range(1, max_retries + 1):
         lidar = None
         try:
@@ -1226,7 +1016,7 @@ def connect_lidar(port, max_retries=5):
                 pass
             time.sleep(0.3)
             try:
-                lidar.reset()   # 내부 버퍼/상태 리셋
+                lidar.reset()
             except Exception:
                 pass
             time.sleep(1.0)
@@ -1255,26 +1045,26 @@ def main():
     x = Picarx()
     wallBackup = WallBackup(x, Get_Drive_Duty())
     batteryMonitor = BatteryMonitor()
-    loadMonitor = SystemLoadMonitor()          # ===== [과부하 감시 추가] =====
+    loadMonitor = SystemLoadMonitor()
 
     left_motor = Motor(PWM("P13"), Pin("D4"))
     right_motor = Motor(PWM("P12"), Pin("D5"))
     steer = Servo("P2")
 
-    # 로봇팔 핀번호 
-    arm_shoulder = Servo("P5")
-    arm_elbow = Servo("P6")
-    arm_grab = Servo("P7")
-    # [초기화 추가] 순간이동(.angle 즉시호출) 대신 슬로우스타터로 0도 복귀
-    init_arm_home(arm_shoulder, arm_elbow, arm_grab)
+    # [로봇팔 추가] arm_setup.build_arm()이 SmoothJoint로 감싸서 4관절 반환
+    # (raw Servo가 아니라 SmoothJoint라서 .move_to()로 부드럽게 움직일 수 있음)
+    arm_base, arm_shoulder, arm_elbow, arm_grab = build_arm(Servo)
+    arm_joints = [arm_base, arm_shoulder, arm_elbow, arm_grab]
 
+    # [로봇팔 슬로우스타터 시험 추가] 터미널을 cbreak 모드로 전환 - Enter 없이
+    # 키 하나만 눌러도 즉시 감지됨. 종료 시(finally) 반드시 원래대로 복구해야 함.
+    _stdin_fd = sys.stdin.fileno()
+    _old_term_settings = termios.tcgetattr(_stdin_fd)
+    tty.setcbreak(_stdin_fd)
 
     sonar = Ultrasonic(Pin("D2"), Pin("D3"))
     lidar = connect_lidar(LIDAR_PORT)
 
-    # ===== [비전 추가] 카메라 시작 + 짐벌 각도 =====
-    # [단순화] 팬은 최초 1회 0도(정면)로 고정하고 이후 절대 움직이지 않는다.
-    #          (기존 버전의 스윕/추적 관련 서보 제어 코드는 전부 제거됨)
     start_vision()
     try:
         x.set_cam_tilt_angle(CAM_TILT_ANGLE)
@@ -1282,10 +1072,8 @@ def main():
     except Exception as e:
         print(f"[비전] 카메라 짐벌 제어 실패: {e}")
 
-    # ===== [스트리밍 추가] 웹 서버 시작 =====
     start_stream()
 
-    # ---------- 전진 전용 (robot_hat) ----------
     def set_incre_Move(target):
         global SPEED_FAST
         SPEED_FAST = min(SPEED_FAST + SPEED_STEP, target)
@@ -1317,7 +1105,6 @@ def main():
                 right_motor.speed(0)
         return SPEED_FAST
 
-    # ---------- 후진 전용 (picarx / WallBackup) ----------
     def back_incre_Move(target):
         global SPEED_BACK
         SPEED_BACK = min(SPEED_BACK + SPEED_STEP, target)
@@ -1327,7 +1114,7 @@ def main():
         angle = max(-STEER_LIMIT, min(STEER_LIMIT, angle))
         if GAIN_REVERSE:
             angle = -angle
-        steer.angle(angle + 5)   # 5도 오른쪽 offset
+        steer.angle(angle + 5)
 
     def read_ultra_cm():
         try:
@@ -1340,46 +1127,44 @@ def main():
 
     print("라이다+초음파+카메라 주행 시작 (Ctrl+C 종료)")
     print(f"[CPU부하] 코어 {loadMonitor.cores}개 감지, "
-          f"경고 기준 {Get_Load_Warn_Threshold():.1f}")   # ===== [과부하 감시 추가] =====
+          f"경고 기준 {Get_Load_Warn_Threshold():.1f}")
     steer.angle(0)
     time.sleep(1)
 
     backCnt = 0
     isBack = False
     isBackFlag = False
-    BACK_TARGET = VELOCITY * 0.65
+    # BACK_TARGET = VELOCITY * 0.65
+    BACK_TARGET = 30
 
-    # backSpeed = 20 * (50 / BACK_TARGET)
     backSpeed = 20 * (50 / BACK_TARGET) if BACK_TARGET != 0 else 0
     current_backSpeed = backSpeed
     steel_gain_result = 0
 
-    # 0730 - 1:47 / 추가    
-    # mission_done = False
-    # try:
-    #   while not mission_done:
     _arrived_notified = False
 
     try:
       while True:
-        # ===== 라이다 재연결 루프 =====
-        # 시리얼 스트림이 깨지면(RPLidarException) 여기서 잡아서
-        # 라이다를 재연결하고 스캔을 이어간다. 프로그램 자체는 죽지 않는다.
         try:
             for scan in lidar.iter_scans(min_len=SCAN_MIN_LEN):
+                # [로봇팔 슬로우스타터 시험 추가] 'p' 입력 감지 -> y/n 확인 -> 테스트 실행
+                key = _check_keypress()
+                if key == 'p':
+                    print("\n[로봇팔] 슬로우 스타터 시험 코드를 동작하겠습니까? y/n")
+                    confirm = sys.stdin.read(1)
+                    if confirm.lower() == 'y':
+                        run_arm_slow_test(arm_joints)
+                    else:
+                        print("[로봇팔] 테스트 취소")
+
                 batteryMonitor.show()
-                # ===== [과부하 감시 추가] =====
-                # BatteryMonitor와 동일한 패턴: interval마다만 실제로 읽고
-                # 출력하므로, 매 스캔마다 호출해도 루프에 부담 없음.
                 load1 = loadMonitor.show()
                 if load1 is not None:
                     update_telemetry(load_1min=float(load1))
-                # ===== [과부하 감시 추가] 끝 =====
 
-                clear_angle, lidar_min = analyze_scan(scan)   # mm
-                ultra_cm = read_ultra_cm()                    # cm (-1이면 실패)
+                clear_angle, lidar_min = analyze_scan(scan)
+                ultra_cm = read_ultra_cm()
 
-                # ===== 후진 구간: picarx(WallBackup) 경로만 사용 =====
                 if (isBack and (backCnt <= current_backSpeed)):
                     duty = back_incre_Move(BACK_TARGET)
                     wallBackup.update(duty)
@@ -1400,15 +1185,8 @@ def main():
                     isBack = False
                     backCnt = 0
 
-                # =================================================================
-                # ===== [비전 추가] 미션 판단 : 반드시 1순위 정지 블록보다 위 =====
-                #   노란 오브젝트는 라이다에도 잡히므로, 30cm(STOP_DIST_MM)에서
-                #   기존 1순위가 먼저 발동하면 목표물 앞에서 후진해버림
-                #   (단, ultra_cm<=VERY_CLOSE_CM 일 땐 mission_step이 스스로
-                #    handled=False를 반환해 아래 탈출 로직으로 위임한다)
-                # =================================================================
                 cmd = mission_step(ultra_cm, lidar_min)
-        
+
                 if cmd.state == ARRIVED:
                     set_decre_Move(0)
                     left_motor.speed(0)
@@ -1417,26 +1195,13 @@ def main():
                     update_telemetry(state=ARRIVED, reason=cmd.reason,
                                      ultra_cm=float(ultra_cm), lidar_mm=float(lidar_min),
                                      speed=0, steer=0.0)
-                    # if not _arrived_notified:
-                    #     print(f"★ 미션 완료: {cmd.reason} - 모터 정지 후 대기 중 (Ctrl+C로 종료)")
-                    #     _arrived_notified = True
-                    # continue
                     if not _arrived_notified:
                         _arrived_notified = True
-                        # [선반 정렬 추가] 참고용 확인일 뿐, 없어도 픽업은 그대로 진행한다.
-                        # (도킹은 초록 선반 기준으로 끝났으므로 원칙상 오브젝트가 있어야 정상)
-                        if not get_object().found:
-                            print("[경고] 도킹은 완료했지만 노란 오브젝트가 안 보입니다 "
-                                  "(선반이 비었거나 카메라 사각지대일 수 있음) - 그래도 픽업 시도")
-                        print(f"★ 미션 완료: {cmd.reason} - 로봇팔 픽업 시작")
-                        pick_up_target(arm_shoulder, arm_grab)
-                        print("★★★ 픽업 완료 - 대기 중 (Ctrl+C로 종료) ★★★")
+                        print(f"★ 미션 완료: {cmd.reason} - 정지 유지 (Ctrl+C로 종료)")
                     continue
-
 
                 if cmd.handled:
                     if not cmd.allow_backup:
-                        # 접근 중에는 후진 상태를 강제로 눌러둔다
                         isBack = False
                         backCnt = 0
                         isBackFlag = False
@@ -1446,17 +1211,13 @@ def main():
                     update_telemetry(state=cmd.state, reason=cmd.reason,
                                      ultra_cm=float(ultra_cm), lidar_mm=float(lidar_min),
                                      speed=cmd.speed, steer=float(cmd.steer))
-                    print(f"[{cmd.state}] {cmd.reason}")
+                    print(f"[{cmd.state}] {cmd.reason} (목표속도={cmd.speed} 실제속도={SPEED_FAST})")
                     continue
-                # ===== [비전 추가] 끝 - 아래는 기존 로직 그대로 =====
 
-                # ===== 1순위: 정지 (둘 중 하나라도 초근접) =====
                 if lidar_min < STOP_DIST_MM or (0 < ultra_cm < Get_Stop_Distance()):
                     set_decre_Move(0)
+                    prev_steer = steel_gain_result
 
-                    prev_steer = steel_gain_result   # 정지 직전까지 유지되던 조향각(=현재 바퀴 각도)
-
-                    # 초근접 + 조향각이 0이 아니면 -> 직진 후진으로 탈출
                     if 0 < ultra_cm <= VERY_CLOSE_CM and abs(prev_steer) > STEER_RESET_TOL:
                         steel_gain_result = 0.0
                         set_steer(0)
@@ -1483,7 +1244,6 @@ def main():
                                      speed=0, steer=float(steel_gain_result))
                     continue
 
-                # ===== 2순위: 위험 → 감속 + 회피 조향 =====
                 if lidar_min < DANGER_DIST_MM or (0 < ultra_cm < Get_Stop_Distance()):
                     set_speed(SPEED_SLOW)
                     steel_gain_result = clear_angle * STEER_GAIN
@@ -1494,7 +1254,6 @@ def main():
                     print(f"[회피] 라이다 {lidar_min:.0f}mm 초음파 {ultra_cm:.0f}cm 트인 {clear_angle:.0f}도")
                     continue
 
-                # ===== 3순위: 안전 → 정상 주행 =====
                 if lidar_min < STEER_ACTIVATE_DIST and abs(clear_angle) >= STEER_DEADZONE:
                     steer_cmd = clear_angle * STEER_GAIN
                     steel_gain_result = steer_cmd
@@ -1515,20 +1274,11 @@ def main():
                 print(f"[주행] 라이다 {lidar_min:.0f}mm 초음파 {ultra_cm:.0f}cm 조향 {steer_cmd:.0f}도")
 
         except RPLidarException as e:
-            # 시리얼 스트림 손상(New scan flags mismatch, Descriptor length
-            # mismatch 등). 차는 안전하게 멈추고 라이다만 재연결한 뒤
-            # 바깥 while 루프가 스캔을 다시 시작한다. 프로그램은 죽지 않는다.
-            #
-            # ===== [과부하 감시 추가] =====
-            # 이 순간의 CPU 부하도 같이 남긴다. 라이다 오류가 CPU 과부하와
-            # 겹치는지(카메라/스트리밍 처리가 밀려서 시리얼 읽기를 놓친 건
-            # 아닌지) 확인하기 위함.
             overload_note = ""
             if loadMonitor.is_overloaded():
                 overload_note = (f" (당시 CPU부하 {loadMonitor.last_load1:.2f} - "
                                   f"과부하 상태였음!)")
             print(f"[라이다] 스캔 중 오류 발생: {e}{overload_note} -> 재연결 시도")
-            # ===== [과부하 감시 추가] 끝 =====
             set_decre_Move(0)
             set_steer(0)
             update_telemetry(state="LIDAR_RECONNECT",
@@ -1543,7 +1293,6 @@ def main():
             time.sleep(1.0)
             try:
                 lidar = connect_lidar(LIDAR_PORT)
-                # 재연결 후 정지 상태에서 재개하도록 후진/조향 상태 초기화
                 isBack = False
                 backCnt = 0
                 isBackFlag = False
@@ -1552,7 +1301,6 @@ def main():
             except Exception as reconnect_err:
                 print(f"[라이다] 재연결 실패: {reconnect_err} - 5초 후 재시도")
                 time.sleep(5.0)
-            # while not mission_done 루프가 다시 for scan in ... 을 시작함
 
     except KeyboardInterrupt:
         print("\n종료 중...")
@@ -1561,24 +1309,29 @@ def main():
         set_steer(0)
         wallBackup.stop(0)
 
-        # ===== [로봇팔 추가] 종료 시 팔을 0도로 초기화 =====
+        # [로봇팔 슬로우스타터 시험 추가] 터미널을 원래 설정으로 복구
         try:
-            # [초기화 추가] 여기서도 순간이동 대신 슬로우스타터 사용
-            init_arm_home(arm_shoulder, arm_elbow, arm_grab)
-            time.sleep(ARM_MOVE_DELAY * 1.5)
+            termios.tcsetattr(_stdin_fd, termios.TCSADRAIN, _old_term_settings)
         except Exception as e:
-            print(f"[로봇팔] 종료 시 초기화 실패: {e}")
-        # ===== [로봇팔 추가] 끝 =====
+            print(f"[터미널] 설정 복구 실패: {e}")
 
-        stop_stream()              # ===== [스트리밍 추가] =====
-        stop_vision()              # ===== [비전 추가] =====
+        # [로봇팔 추가] 종료 시(정상 종료든 Ctrl+C든) 4관절 전부 천천히 0도로 복귀
+        # control_arm.py 종료부와 동일한 패턴: SmoothJoint.move_to()가 부드러운 이동을 담당
+        try:
+            print("[로봇팔] 종료 - 0도로 천천히 복귀 중...")
+            for j in arm_joints:
+                j.move_to(0, speed=ARM_HOME_SPEED)
+            print("[로봇팔] 복귀 완료")
+        except Exception as e:
+            print(f"[로봇팔] 종료 시 복귀 실패: {e}")
+
+        stop_stream()
+        stop_vision()
         lidar.stop()
         lidar.stop_motor()
         lidar.disconnect()
-        # ===== [과부하 감시 추가] =====
         print(f"[CPU부하] 이번 실행 중 최고 부하: {loadMonitor.max_load1:.2f} "
               f"(경고 기준 {Get_Load_Warn_Threshold():.1f})")
-        # ===== [과부하 감시 추가] 끝 =====
         print("정지 완료")
 
 

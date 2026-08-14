@@ -1,27 +1,80 @@
 """
 arm.py
-역할: 로봇팔 4개 서보 제어 (movement.py와 같은 원칙 - "어떻게 움직이는가"만 담당)
+역할: 로봇팔 4개 서보를 입력받은 각도로 움직이는 수동 제어 도구.
+      arm_setup.build_arm()을 재사용해서 관절별 안전 범위(min/max)를
+      자동으로 지켜준다 (범위 밖 값을 입력해도 조용히 클램프됨).
+
+이전 버전과의 차이:
+  - `from robot_hat import Servo, device` -> `device`는 robot_hat이
+    export하는 이름이 아니라서 import 시점에 에러가 났음.
+    공식 사용법대로 `from robot_hat import Servo, reset_mcu`로 수정.
+  - base/shoulder/elbow가 전부 주석 처리되어 그립만 움직이던 문제 해결 -
+    arm_setup.build_arm()으로 4관절 전부 생성.
 """
 
-from robot_hat import Servo, device
 import time
+from robot_hat import Servo, reset_mcu
+from arm_setup import build_arm
 
-#device.reset_mcu()
-# time.sleep(0.5)
-# 채널은 실제 배선한 P번호에 맞춰 수정
-base = Servo("P1")
-shoulder = Servo("P2")
-elbow = Servo("P3")
-gripper = Servo("P5")
+ARM_MOVE_SPEED = 30.0   # 도/초 - 필요시 조정
+
+reset_mcu()
+time.sleep(0.5)
+
+base, shoulder, elbow, gripper = build_arm(servo_factory=Servo)
 
 
 def set_arm_angles(base_angle=0, shoulder_angle=0, elbow_angle=0, gripper_angle=0):
-    base.angle(base_angle)
-    shoulder.angle(shoulder_angle)
-    elbow.angle(elbow_angle)
-    gripper.angle(gripper_angle)
+    """
+    4관절을 각각 지정한 각도로 이동시킨다.
+    각 관절의 min/max 범위(arm_setup.py에 정의됨)를 벗어나는 값은
+    SmoothJoint.move_to() 내부에서 자동으로 그 범위 안으로 잘린다.
+    """
+    base.move_to(base_angle, speed=ARM_MOVE_SPEED)
+    shoulder.move_to(shoulder_angle, speed=ARM_MOVE_SPEED)
+    elbow.move_to(elbow_angle, speed=ARM_MOVE_SPEED)
+    gripper.move_to(gripper_angle, speed=ARM_MOVE_SPEED)
+    print(f"[로봇팔] base={base.angle:.1f} shoulder={shoulder.angle:.1f} "
+          f"elbow={elbow.angle:.1f} gripper={gripper.angle:.1f} (실제 적용된 각도)")
+
+
+def _parse_line(line):
+    """'base shoulder elbow gripper' 형태의 한 줄을 4개 float로 파싱. 실패 시 None."""
+    parts = line.strip().split()
+    if len(parts) != 4:
+        return None
+    try:
+        return [float(p) for p in parts]
+    except ValueError:
+        return None
 
 
 if __name__ == "__main__":
-    set_arm_angles(0, 0, 30, 0)   # 모든 관절 중앙(0도)으로
-    time.sleep(1)
+    print("4관절 각도 입력 도구")
+    print("형식: base shoulder elbow gripper  (예: -10 20 5 0)")
+    print("종료: q 또는 Ctrl+C")
+    print(f"허용 범위 - base:[{base.min_angle},{base.max_angle}] "
+          f"shoulder:[{shoulder.min_angle},{shoulder.max_angle}] "
+          f"elbow:[{elbow.min_angle},{elbow.max_angle}] "
+          f"gripper:[{gripper.min_angle},{gripper.max_angle}]")
+
+    try:
+        while True:
+            raw = input("각도 입력> ")
+            if raw.strip().lower() == 'q':
+                break
+
+            values = _parse_line(raw)
+            if values is None:
+                print("★ 형식 오류 - 숫자 4개를 공백으로 구분해서 입력하세요 (예: -10 20 5 0)")
+                continue
+
+            set_arm_angles(*values)
+    except KeyboardInterrupt:
+        print("\n종료 중...")
+    finally:
+        # 종료 시 4관절 모두 슬로우스타터로 0도 복귀
+        print("[로봇팔] 0도로 복귀 중...")
+        for j in (base, shoulder, elbow, gripper):
+            j.move_to(0, speed=ARM_MOVE_SPEED)
+        print("[로봇팔] 종료 완료")

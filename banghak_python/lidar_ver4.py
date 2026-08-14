@@ -59,7 +59,7 @@ REAR_SAFETY_MARGIN_CM = 11
 DEFAULT_BACK_TARGET_CM = 60
 
 # 속도
-VELOCITY = 40
+VELOCITY = 45
 # VELOCITY = 0
 SPEED_FAST = 0
 SPEED_BACK = 0
@@ -101,7 +101,7 @@ MIN_TARGET_AREA = 400
 
 # 거리 추정 (핀홀 모델): 거리cm = (실제폭cm * focal_px) / 화면폭px
 TARGET_REAL_WIDTH_CM = 8.0  # ★ 본인 오브젝트 실제 가로폭으로 수정
-CAM_FOCAL_PX = 528.0        # ★ 반드시 캘리브레이션 필요 (해상도 바꾸면 재측정)
+CAM_FOCAL_PX = 960.0        # ★ 반드시 캘리브레이션 필요 (해상도 바꾸면 재측정)
 
 ARRIVE_DISTANCE_CM = 10     # 이 거리 + 화면 중앙 정렬되면 도착 처리
 ARRIVE_CENTER_TOL = 0.15    # 도착 판정용 중앙 정렬 허용 오프셋
@@ -122,12 +122,12 @@ GREEN_V_MIN, GREEN_V_MAX = 60, 255
 MIN_SHELF_AREA = 500
 
 # 선반 정면에 칠한 초록색 면의 실제 가로폭(cm). ★ 반드시 실측해서 교체
-SHELF_REAL_WIDTH_CM = 20.0
+SHELF_REAL_WIDTH_CM = 10.0
 # 거리 추정에 쓰는 초점거리는 카메라가 같으므로 CAM_FOCAL_PX를 공유해서 사용한다.
 
 # ---- 도킹(정밀 주차) 단계 ----
 DOCK_ENTER_DISTANCE_CM = 40.0   # 이 거리 이내로 들어오면 APPROACH -> DOCK 전환
-DOCK_SPEED = 20                 # 도킹 중 크리핑 속도 (★ 10에서 전진이 안 걸려 15로 상향 - 실차로 더 조정 필요)
+DOCK_SPEED = 21                 # 도킹 중 크리핑 속도 (★ 10에서 전진이 안 걸려 15로 상향 - 실차로 더 조정 필요)
 DOCK_OFFSET_TOL = 0.05          # 도킹 완료 판정 - 좌우 정렬 허용 오차
 DOCK_SKEW_TOL = 0.15            # 도킹 완료 판정 - 틀어짐 허용 오차
 SKEW_STEER_GAIN = 20.0          # skew(-1~+1) -> 조향각 보정 계수
@@ -148,7 +148,7 @@ ARM_STEP_DEG = 2         # 한 번에 움직이는 각도 (작을수록 부드�
 ARM_STEP_DELAY = 0.02    # 각 스텝 사이 대기시간(초) - 작을수록 빠름
 ARM_RAMP_STEPS = 6       # [슬로우스타터 추가] 이 스텝 수에 걸쳐 서서히 ARM_STEP_DEG까지 가속
 
-APPROACH_SPEED = 20
+APPROACH_SPEED = 24
 TARGET_STEER_GAIN = 30.0    # 화면 오프셋(-1~+1) -> 조향각 변환 계수 (핵심)
 LOST_TIMEOUT = 2.0
 DETOUR_TIME = 1.2
@@ -1041,7 +1041,8 @@ def mission_step(ultra_cm, lidar_min):
     return Command(handled=True, speed=speed, steer=steer, allow_backup=False,
                    state=APPROACH,
                    reason=f"접근 오프셋={shelf.offset:+.2f} "
-                          f"카메라≈{shelf.distance_cm:.0f}cm 초음파={ultra_cm:.0f}cm")
+                          f"카메라≈{shelf.distance_cm:.0f}cm 초음파={ultra_cm:.0f}cm "
+                          f"라이다={lidar_min:.0f}mm")
 
 
 def calibrate_vision():
@@ -1262,11 +1263,12 @@ def main():
     steer = Servo("P2")
 
     # 로봇팔 핀번호 
+    arm_base = Servo("P4")
     arm_shoulder = Servo("P5")
     arm_elbow = Servo("P6")
     arm_grab = Servo("P7")
     # [초기화 추가] 순간이동(.angle 즉시호출) 대신 슬로우스타터로 0도 복귀
-    init_arm_home(arm_shoulder, arm_elbow, arm_grab)
+    # init_arm_home(arm_shoulder, arm_elbow, arm_grab) # 로봇팔 초기화
 
 
     sonar = Ultrasonic(Pin("D2"), Pin("D3"))
@@ -1446,7 +1448,7 @@ def main():
                     update_telemetry(state=cmd.state, reason=cmd.reason,
                                      ultra_cm=float(ultra_cm), lidar_mm=float(lidar_min),
                                      speed=cmd.speed, steer=float(cmd.steer))
-                    print(f"[{cmd.state}] {cmd.reason}")
+                    print(f"[{cmd.state}] {cmd.reason} (목표속도={cmd.speed} 실제속도={SPEED_FAST})")
                     continue
                 # ===== [비전 추가] 끝 - 아래는 기존 로직 그대로 =====
 
@@ -1564,7 +1566,7 @@ def main():
         # ===== [로봇팔 추가] 종료 시 팔을 0도로 초기화 =====
         try:
             # [초기화 추가] 여기서도 순간이동 대신 슬로우스타터 사용
-            init_arm_home(arm_shoulder, arm_elbow, arm_grab)
+            # init_arm_home(arm_shoulder, arm_elbow, arm_grab) #로봇팔 초기화 함수
             time.sleep(ARM_MOVE_DELAY * 1.5)
         except Exception as e:
             print(f"[로봇팔] 종료 시 초기화 실패: {e}")
