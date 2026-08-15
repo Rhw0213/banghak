@@ -29,6 +29,12 @@ from picamera2 import Picamera2
 from rplidar import RPLidar, RPLidarException
 from robot_hat import Motor, Servo, Pin, PWM, reset_mcu, Ultrasonic
 from arm_setup import build_arm   # [로봇팔 추가] 관절을 SmoothJoint로 감싸서 반환
+from arm_visual_servo import (    # [픽업 추가] 빨간 마커 + 노란 타겟 시각 서보 픽업
+    visual_servo_pick,
+    VS_CAM_TILT_ANGLE,
+    start_stream as vs_start_stream,
+    stop_stream as vs_stop_stream,
+)
 
 from avoidance_go_back import Get_Stop_Distance, WallBackup, Get_Drive_Duty
 from picarx import Picarx
@@ -64,7 +70,8 @@ SPEED_STEP = 3
 SCAN_MIN_LEN = 60
 
 # 초근접 탈출 (좁은 공간에서 조향 꺾인 채 후진하며 갇히는 것 방지)
-VERY_CLOSE_CM = 4
+# VERY_CLOSE_CM = 4
+VERY_CLOSE_CM = 3
 STEER_RESET_TOL = 3.0
 
 # ===== [과부하 감시 추가] 시스템 부하(CPU) 설정 =====
@@ -91,7 +98,8 @@ MIN_TARGET_AREA = 400
 TARGET_REAL_WIDTH_CM = 8.0
 CAM_FOCAL_PX = 960.0
 
-ARRIVE_DISTANCE_CM = 10
+ARRIVE_DISTANCE_CM = 10 #선반 도착 확인 거리
+# ARRIVE_DISTANCE_CM = 5
 ARRIVE_CENTER_TOL = 0.15
 
 
@@ -107,11 +115,37 @@ MIN_SHELF_AREA = 500
 
 SHELF_REAL_WIDTH_CM = 10.0
 
+# =========================================================================
+# ===== [파란 장애물 추가] 라이다 사각지대(라이다 높이보다 낮은) 오브젝트
+#   장애물 인식 설정. 라이다는 이 물체를 아예 볼 수 없어서 카메라로 판단.
+#   초음파는 감지 가능한 높이라서 "있다/탈출했다" 판정은 초음파 기반 유지.
+# =========================================================================
+BLUE_H_MIN, BLUE_H_MAX = 100, 125      # ★ calib 모드에서 웹 UI로 실측 후 교체
+BLUE_S_MIN, BLUE_S_MAX = 60, 255
+BLUE_V_MIN, BLUE_V_MAX = 40, 255
+
+MIN_OBSTACLE_AREA = 400
+OBSTACLE_REAL_WIDTH_CM = 8.0    # ★ 실제 장애물 가로폭으로 교체
+OBSTACLE_STEER_GAIN = 25.0      # 카메라 기반 회피 조향 강도(도)
+
 DOCK_ENTER_DISTANCE_CM = 40.0
-DOCK_SPEED = 25
+# DOCK_SPEED = 22
+DOCK_SPEED = 23
 DOCK_OFFSET_TOL = 0.05
 DOCK_SKEW_TOL = 0.15
 SKEW_STEER_GAIN = 20.0
+
+# [안전장치 추가] DOCK 중 카메라가 선반을 놓쳤을 때, 초음파가 여전히 이
+# 거리 이내를 가리키면 "코앞에 뭔가 있다"고 보고 SEARCH로 풀어주지 않고
+# 그냥 정지시킨다. (선반을 놓친 채로 SEARCH -> CRUISE로 넘어가면 정상속도로
+# 다시 튀어나가서 목표물을 그냥 지나쳐버리는 문제가 있었음)
+DOCK_LOST_SAFE_ULTRA_CM = 17
+
+# [감속 추가] DOCK 중 이 거리 이내로 들어오면 속도를 점점 줄인다.
+# 최소 속도는 DOCK_SPEED보다 너무 낮추지 않음 (예전에 바닥 마찰로 아예
+# 안 움직이던 문제가 있었기 때문 - DOCK_SPEED=21까지 낮췄던 이력 참고)
+DOCK_SLOWDOWN_START_CM = 15
+DOCK_SLOWDOWN_MIN_SPEED = 21
 
 # [로봇팔 추가] 종료 시 팔을 0도로 복귀시킬 때 쓰는 속도(도/초)
 ARM_HOME_SPEED = 30.0
@@ -190,6 +224,8 @@ _object_lock = threading.Lock()
 _object_result = TargetInfo()
 _shelf_lock = threading.Lock()
 _shelf_result = TargetInfo()
+_obstacle_lock = threading.Lock()      # [파란 장애물 추가]
+_obstacle_result = TargetInfo()
 
 _vision_running = False
 _vision_thread = None
@@ -209,6 +245,12 @@ def get_yellow_hsv_range():
 def get_green_hsv_range():
     lower = np.array([GREEN_H_MIN, GREEN_S_MIN, GREEN_V_MIN])
     upper = np.array([GREEN_H_MAX, GREEN_S_MAX, GREEN_V_MAX])
+    return lower, upper
+
+
+def get_blue_hsv_range():   # [파란 장애물 추가]
+    lower = np.array([BLUE_H_MIN, BLUE_S_MIN, BLUE_V_MIN])
+    upper = np.array([BLUE_H_MAX, BLUE_S_MAX, BLUE_V_MAX])
     return lower, upper
 
 
@@ -281,8 +323,15 @@ def detect_shelf(frame):
                         SHELF_REAL_WIDTH_CM, compute_skew=True)
 
 
+def detect_obstacle(frame):   # [파란 장애물 추가]
+    """라이다 사각지대 낮은 오브젝트 장애물 인식. skew는 방향 판단에 불필요."""
+    lower, upper = get_blue_hsv_range()
+    return detect_color(frame, lower, upper, MIN_OBSTACLE_AREA,
+                        OBSTACLE_REAL_WIDTH_CM, compute_skew=False)
+
+
 def _vision_loop():
-    global _object_result, _shelf_result
+    global _object_result, _shelf_result, _obstacle_result
     last_stream = 0.0
     fail_count = 0
     while _vision_running:
@@ -296,10 +345,13 @@ def _vision_loop():
         fail_count = 0
         obj_info, obj_mask = detect_yellow(frame)
         shelf_info, shelf_mask = detect_shelf(frame)
+        obstacle_info, _ = detect_obstacle(frame)   # [파란 장애물 추가]
         with _object_lock:
             _object_result = obj_info
         with _shelf_lock:
             _shelf_result = shelf_info
+        with _obstacle_lock:                        # [파란 장애물 추가]
+            _obstacle_result = obstacle_info
         now = time.time()
         if _stream_clients > 0 and (now - last_stream) >= (1.0 / STREAM_FPS):
             last_stream = now
@@ -354,6 +406,12 @@ def get_object():
 def get_shelf():
     with _shelf_lock:
         return _shelf_result
+
+
+def get_obstacle():   # [파란 장애물 추가]
+    """라이다 사각지대 낮은 오브젝트 장애물 최신 인식 결과"""
+    with _obstacle_lock:
+        return _obstacle_result
 
 
 def Get_Load_Warn_Threshold():
@@ -515,12 +573,14 @@ PAGE_HTML = """<!DOCTYPE html>
 <h3>HSV 범위 튜닝 - 편집 대상:
   <button id="btn_yellow" onclick="setColor('yellow')">노랑(오브젝트)</button>
   <button id="btn_green" onclick="setColor('green')">초록(선반)</button>
+  <button id="btn_blue" onclick="setColor('blue')">파랑(장애물)</button>
 </h3>
 <div id="sliders"></div>
 <script>
 const P=[["h_min",179],["h_max",179],["s_min",255],["s_max",255],["v_min",255],["v_max",255]];
 const box=document.getElementById('sliders');
 let curColor='yellow';
+const COLORS=['yellow','green','blue'];
 P.forEach(([k,max])=>{
   const d=document.createElement('div');d.className='row';
   d.innerHTML=`<label>${k}</label><input type=range min=0 max=${max} id="${k}">
@@ -534,12 +594,10 @@ function send(){
       document.getElementById(k).value);
 }
 P.forEach(([k])=>document.getElementById(k).addEventListener('input',send));
+function updateBtns(c){COLORS.forEach(x=>document.getElementById('btn_'+x).style.opacity=(x===c)?1:0.5);}
 function setColor(c){
-  curColor=c;
-  window._init=false;
-  fetch('/set?editcolor='+c);
-  document.getElementById('btn_yellow').style.opacity = (c==='yellow')?1:0.5;
-  document.getElementById('btn_green').style.opacity = (c==='green')?1:0.5;
+  curColor=c; window._init=false;
+  fetch('/set?editcolor='+c); updateBtns(c);
 }
 function dump(){fetch('/set?dump=1').then(()=>alert('라즈베리파이 터미널에 출력했습니다'));}
 async function poll(){
@@ -556,16 +614,16 @@ async function poll(){
         '  거리 '+s.shelf.distance_cm.toFixed(0)+'cm  폭 '+s.shelf.width_px.toFixed(0)+'px')
         :'없음'}\\n`+
       `노랑 오브젝트: ${s.object.found?('발견  오프셋 '+s.object.offset.toFixed(2)+
-        '  거리 '+s.object.distance_cm.toFixed(0)+'cm')
-        :'없음'}`;
+        '  거리 '+s.object.distance_cm.toFixed(0)+'cm'):'없음'}\\n`+
+      `파랑 장애물: ${s.obstacle?s.obstacle.found?('발견  오프셋 '+s.obstacle.offset.toFixed(2)+
+        '  거리 '+s.obstacle.distance_cm.toFixed(0)+'cm'):'없음':'없음'}`;
     if(!window._init){
-      window._init=true;
-      curColor=s.edit_color;
-      const hsv = (s.edit_color==='green')?s.hsv_green:s.hsv_yellow;
+      window._init=true; curColor=s.edit_color;
+      const hsvMap={yellow:s.hsv_yellow,green:s.hsv_green,blue:s.hsv_blue};
+      const hsv=hsvMap[s.edit_color]||s.hsv_yellow;
       P.forEach(([k])=>{document.getElementById(k).value=hsv[k];
                         document.getElementById(k+'v').textContent=hsv[k];});
-      document.getElementById('btn_yellow').style.opacity = (s.edit_color==='yellow')?1:0.5;
-      document.getElementById('btn_green').style.opacity = (s.edit_color==='green')?1:0.5;
+      updateBtns(s.edit_color);
     }
   }catch(e){}
 }
@@ -583,6 +641,8 @@ class _StreamHandler(BaseHTTPRequestHandler):
         global COLOR_S_MAX, COLOR_V_MIN, COLOR_V_MAX
         global GREEN_H_MIN, GREEN_H_MAX, GREEN_S_MIN
         global GREEN_S_MAX, GREEN_V_MIN, GREEN_V_MAX
+        global BLUE_H_MIN, BLUE_H_MAX, BLUE_S_MIN
+        global BLUE_S_MAX, BLUE_V_MIN, BLUE_V_MAX
 
         parsed = urlparse(self.path)
         path = parsed.path
@@ -598,6 +658,7 @@ class _StreamHandler(BaseHTTPRequestHandler):
         elif path == '/status':
             obj = get_object()
             shelf = get_shelf()
+            obstacle = get_obstacle()
             with _telemetry_lock:
                 data = dict(_telemetry)
             data.update({
@@ -618,6 +679,12 @@ class _StreamHandler(BaseHTTPRequestHandler):
                     "distance_cm": shelf.distance_cm,
                     "width_px": shelf.width_px,
                 },
+                "obstacle": {
+                    "found": bool(obstacle.found and obstacle.is_fresh()),
+                    "offset": obstacle.offset,
+                    "distance_cm": obstacle.distance_cm,
+                    "width_px": obstacle.width_px,
+                },
                 "hsv_yellow": {
                     "h_min": COLOR_H_MIN, "h_max": COLOR_H_MAX,
                     "s_min": COLOR_S_MIN, "s_max": COLOR_S_MAX,
@@ -627,6 +694,11 @@ class _StreamHandler(BaseHTTPRequestHandler):
                     "h_min": GREEN_H_MIN, "h_max": GREEN_H_MAX,
                     "s_min": GREEN_S_MIN, "s_max": GREEN_S_MAX,
                     "v_min": GREEN_V_MIN, "v_max": GREEN_V_MAX,
+                },
+                "hsv_blue": {
+                    "h_min": BLUE_H_MIN, "h_max": BLUE_H_MAX,
+                    "s_min": BLUE_S_MIN, "s_max": BLUE_S_MAX,
+                    "v_min": BLUE_V_MIN, "v_max": BLUE_V_MAX,
                 },
             })
             body = json.dumps(data).encode('utf-8')
@@ -654,6 +726,13 @@ class _StreamHandler(BaseHTTPRequestHandler):
                 GREEN_S_MAX = gv('s_max', GREEN_S_MAX)
                 GREEN_V_MIN = gv('v_min', GREEN_V_MIN)
                 GREEN_V_MAX = gv('v_max', GREEN_V_MAX)
+            elif target_color == 'blue':
+                BLUE_H_MIN = gv('h_min', BLUE_H_MIN)
+                BLUE_H_MAX = gv('h_max', BLUE_H_MAX)
+                BLUE_S_MIN = gv('s_min', BLUE_S_MIN)
+                BLUE_S_MAX = gv('s_max', BLUE_S_MAX)
+                BLUE_V_MIN = gv('v_min', BLUE_V_MIN)
+                BLUE_V_MAX = gv('v_max', BLUE_V_MAX)
             elif target_color == 'yellow':
                 COLOR_H_MIN = gv('h_min', COLOR_H_MIN)
                 COLOR_H_MAX = gv('h_max', COLOR_H_MAX)
@@ -849,6 +928,17 @@ def mission_step(ultra_cm, lidar_min):
 
         if not (shelf.found and shelf.is_fresh()):
             if now - _last_seen_time > LOST_TIMEOUT:
+                # [안전장치 추가] 카메라는 선반을 놓쳤지만, 초음파가 여전히
+                # 가까운 거리를 가리키고 있으면 "코앞에 뭔가 있다"는 뜻이므로
+                # SEARCH로 풀어주지 않고 일단 정지 유지. (여기서 SEARCH로
+                # 풀어주면 라이다도 이 물체를 못 보는 경우 CRUISE로 넘어가서
+                # 정상속도로 그냥 지나쳐버리는 문제가 있었음)
+                if 0 < ultra_cm <= DOCK_LOST_SAFE_ULTRA_CM:
+                    print(f"[미션] 도킹 중 선반 상실했지만 초음파 {ultra_cm:.0f}cm "
+                          f"근접 - SEARCH로 안 풀고 정지 유지")
+                    return Command(handled=True, speed=0, steer=0.0,
+                                   allow_backup=False, state=DOCK,
+                                   reason=f"선반 상실 but 근접({ultra_cm:.0f}cm) - 정지 유지")
                 print("[미션] 도킹 중 선반 상실 -> SEARCH 복귀")
                 MISSION_STATE = SEARCH
                 return Command(handled=False, state=SEARCH, reason="선반 상실")
@@ -865,10 +955,22 @@ def mission_step(ultra_cm, lidar_min):
             return Command(handled=True, speed=0, steer=0.0, allow_backup=False,
                            state=ARRIVED, reason=f"선반 {ultra_cm:.0f}cm 도킹 완료")
 
-        return Command(handled=True, speed=DOCK_SPEED, steer=_dock_steer(shelf),
+        # [감속 추가] 지금까지는 거리와 무관하게 항상 DOCK_SPEED 고정이라,
+        # 정렬이 이미 맞았어도 감속 없이 좁은 도착 판정 구간(ARRIVE_DISTANCE_CM
+        # ~VERY_CLOSE_CM, 겨우 2cm 폭)을 그대로 통과해버려서 충돌이 발생했다.
+        # DOCK_SLOWDOWN_START_CM 이내로 들어오면 거리에 비례해 속도를 낮추되,
+        # 바닥 마찰로 안 움직이는 문제가 재발하지 않도록 최소값은 유지한다.
+        dock_speed = DOCK_SPEED
+        if 0 < ultra_cm <= DOCK_SLOWDOWN_START_CM:
+            ratio = max(0.0, (ultra_cm - ARRIVE_DISTANCE_CM)
+                        / (DOCK_SLOWDOWN_START_CM - ARRIVE_DISTANCE_CM))
+            dock_speed = DOCK_SLOWDOWN_MIN_SPEED + \
+                int((DOCK_SPEED - DOCK_SLOWDOWN_MIN_SPEED) * ratio)
+
+        return Command(handled=True, speed=dock_speed, steer=_dock_steer(shelf),
                        allow_backup=False, state=DOCK,
                        reason=f"도킹 offset={shelf.offset:+.2f} skew={shelf.skew:+.2f} "
-                              f"거리={ultra_cm:.0f}cm")
+                              f"거리={ultra_cm:.0f}cm 속도={dock_speed}")
 
     if 0 < ultra_cm <= VERY_CLOSE_CM:
         return Command(handled=False, state=APPROACH, reason="접근 중 초근접 - 기존 탈출로 위임")
@@ -1072,7 +1174,13 @@ def main():
     except Exception as e:
         print(f"[비전] 카메라 짐벌 제어 실패: {e}")
 
+    # [픽업 추가] visual_servo_pick()에 넘길 프레임 획득 함수
+    # lidar_ver5의 grab_frame()을 그대로 재사용 (이미 picam2로 BGR 반환)
+    def grab_frame_fn():
+        return grab_frame()
+
     start_stream()
+    vs_start_stream()   # [픽업 추가] arm_visual_servo 전용 스트리밍 (8001 포트)
 
     def set_incre_Move(target):
         global SPEED_FAST
@@ -1135,13 +1243,23 @@ def main():
     isBack = False
     isBackFlag = False
     # BACK_TARGET = VELOCITY * 0.65
-    BACK_TARGET = 30
+    BACK_TARGET = 40
 
     backSpeed = 20 * (50 / BACK_TARGET) if BACK_TARGET != 0 else 0
     current_backSpeed = backSpeed
     steel_gain_result = 0
 
     _arrived_notified = False
+
+    # [반대조향 탈출 추가] 2순위(AVOID)에서 쓴 조향값을 저장해뒀다가,
+    # 장애물이 사라진 걸 확인하면 그 반대 방향으로 잠깐 꺾어서
+    # 한쪽으로 계속 도는 상황을 방지한다.
+    ESCAPE_ULTRA_CM = 10     # 이 거리 이내에 뭔가 있으면 "아직 탈출 안 함"
+    ESCAPE_HOLD_SEC = 1.0    # 반대 조향을 유지하는 시간(초)
+    _avoid_last_steer = 0.0
+    _was_avoiding = False
+    _recovery_until = 0.0
+    _recovery_steer = 0.0
 
     try:
       while True:
@@ -1197,7 +1315,32 @@ def main():
                                      speed=0, steer=0.0)
                     if not _arrived_notified:
                         _arrived_notified = True
-                        print(f"★ 미션 완료: {cmd.reason} - 정지 유지 (Ctrl+C로 종료)")
+                        print(f"★ 미션 완료: {cmd.reason} - 로봇팔 픽업 시작")
+
+                        # [픽업 추가] 카메라를 위로 들어서 팔+타겟이 보이도록
+                        try:
+                            x.set_cam_tilt_angle(VS_CAM_TILT_ANGLE)
+                            print(f"[픽업] 카메라 틸트 {VS_CAM_TILT_ANGLE}도로 변경")
+                        except Exception as e:
+                            print(f"[픽업] 카메라 틸트 실패({e}) - 현재 각도로 진행")
+
+                        # [픽업 추가] 시각 서보 픽업 실행
+                        # visual_servo_pick은 내부에서:
+                        #   대기자세 → 하강탐색(빨간마커) → 인터리브 정렬 → 그랩+검증 → 복귀
+                        try:
+                            pick_success, pick_reason = visual_servo_pick(
+                                arm_base, arm_shoulder, arm_elbow, arm_grab, grab_frame_fn
+                            )
+                            print(f"[픽업] {'성공' if pick_success else '실패'}: {pick_reason}")
+                        except Exception as e:
+                            print(f"[픽업] 예외 발생: {e}")
+
+                        # 픽업 완료 후 카메라를 원래 주행 각도로 복귀
+                        try:
+                            x.set_cam_tilt_angle(CAM_TILT_ANGLE)
+                        except Exception:
+                            pass
+
                     continue
 
                 if cmd.handled:
@@ -1246,15 +1389,52 @@ def main():
 
                 if lidar_min < DANGER_DIST_MM or (0 < ultra_cm < Get_Stop_Distance()):
                     set_speed(SPEED_SLOW)
-                    steel_gain_result = clear_angle * STEER_GAIN
+
+                    # [파란 장애물 추가] 카메라가 파란 장애물을 보고 있으면
+                    # 그 위치로 회피 방향을 결정. 라이다가 못 보는 낮은 장애물의
+                    # 경우 clear_angle이 신뢰할 수 없어서 카메라를 우선 사용.
+                    # 카메라에도 안 보이면 기존 라이다 clear_angle 그대로 사용.
+                    obstacle = get_obstacle()
+                    if obstacle.found and obstacle.is_fresh():
+                        avoid_dir = -1 if obstacle.offset < 0 else 1
+                        steel_gain_result = avoid_dir * OBSTACLE_STEER_GAIN
+                        avoid_source = f"카메라(파란 장애물 offset={obstacle.offset:+.2f})"
+                    else:
+                        steel_gain_result = clear_angle * STEER_GAIN
+                        avoid_source = "라이다"
+
                     set_steer(steel_gain_result)
+                    # [반대조향 탈출 추가] 지금 쓴 조향값을 저장해두고 "회피 중" 표시
+                    _avoid_last_steer = steel_gain_result
+                    _was_avoiding = True
                     update_telemetry(state="AVOID", reason="위험거리 회피",
                                      ultra_cm=float(ultra_cm), lidar_mm=float(lidar_min),
                                      speed=SPEED_SLOW, steer=float(steel_gain_result))
-                    print(f"[회피] 라이다 {lidar_min:.0f}mm 초음파 {ultra_cm:.0f}cm 트인 {clear_angle:.0f}도")
+                    print(f"[회피] 라이다 {lidar_min:.0f}mm 초음파 {ultra_cm:.0f}cm "
+                          f"판단근거={avoid_source} 조향={steel_gain_result:.0f}도")
                     continue
 
-                if lidar_min < STEER_ACTIVATE_DIST and abs(clear_angle) >= STEER_DEADZONE:
+                # [반대조향 탈출 추가] 회피가 끝났으면(초음파 기준 10cm 이내에
+                # 아무것도 없으면) 저장해둔 조향값의 반대 방향으로 잠깐 꺾는다.
+                now = time.time()
+                if _was_avoiding and not (0 < ultra_cm <= ESCAPE_ULTRA_CM):
+                    _recovery_steer = -_avoid_last_steer
+                    _recovery_until = now + ESCAPE_HOLD_SEC
+                    _was_avoiding = False
+                    print(f"[탈출] 장애물 벗어남 확인 - 반대 조향 {_recovery_steer:.0f}도로 "
+                          f"{ESCAPE_HOLD_SEC:.0f}초간 보정")
+
+                if now < _recovery_until:
+                    steer_cmd = _recovery_steer
+                    steel_gain_result = steer_cmd
+                elif _recovery_until != 0.0:
+                    # [반대조향 탈출 추가] 유지시간이 막 끝난 시점 - 다음 판단으로
+                    # 넘기지 않고 일단 명시적으로 정방향(0도)으로 리셋한다.
+                    steer_cmd = 0
+                    steel_gain_result = 0.0
+                    _recovery_until = 0.0
+                    print("[탈출] 반대 조향 종료 - 바퀴 정방향(0도)으로 복귀")
+                elif lidar_min < STEER_ACTIVATE_DIST and abs(clear_angle) >= STEER_DEADZONE:
                     steer_cmd = clear_angle * STEER_GAIN
                     steel_gain_result = steer_cmd
                 else:
@@ -1326,6 +1506,7 @@ def main():
             print(f"[로봇팔] 종료 시 복귀 실패: {e}")
 
         stop_stream()
+        vs_stop_stream()   # [픽업 추가] arm_visual_servo 스트리밍 종료
         stop_vision()
         lidar.stop()
         lidar.stop_motor()
@@ -1336,7 +1517,6 @@ def main():
 
 
 if __name__ == "__main__":
-    import sys
     if len(sys.argv) > 1 and sys.argv[1] == "calib":
         calibrate_vision()
     else:
